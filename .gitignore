@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 数据目录（不上传用户数据和备份）
+data/
+data_backup_*/
+
+# 日志和 pid
+*.log
+kb_server.log
+.kb_pid
+
+# 推送/调试脚本（内含敏感信息）
+_push_github.py
+_debug_*.py
+_verify_*.py
+
+# 系统
+.DS_Store
+Thumbs.db
