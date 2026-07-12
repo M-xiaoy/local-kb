@@ -18,6 +18,7 @@ class Paths:
     spheres_data: str = "data/spheres/spheres.json"
     registry_map: str = "data/spheres/registry.json"
     uploads_dir: str = "data/uploads/"
+    wal_dir: str = "data/wal/"
 
 
 # ──────────────────────────────────────────────

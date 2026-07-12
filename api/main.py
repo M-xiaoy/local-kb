@@ -34,6 +34,7 @@ from pipeline.embedder import Embedder
 from storage.faiss_store import FaissStore
 from storage.registry import Registry
 from storage.sphere_store import SphereStore, Sphere, make_sphere_id
+from storage.wal import WalManager, WAL_READY, WAL_COMMITTING
 from retrieval.field_detector import FieldDetector
 from retrieval.diversity_sorter import DiversitySorter
 from retrieval.retriever import Retriever, RetrievalResult
@@ -179,6 +180,7 @@ class AppState:
         )
         self.uploads_dir = Path(cfg_paths.uploads_dir)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
+        self.wal = WalManager(str(Path(cfg_paths.wal_dir)))
 
     def is_loaded(self) -> bool:
         return self.faiss_store.is_built
@@ -229,6 +231,20 @@ class StatusResponse(BaseModel):
 async def startup():
     """启动时从持久化加载已有状态"""
     try:
+        # WAL 恢复：处理未完成的写入
+        recovery = state.wal.recover(
+            sphere_store=state.sphere_store,
+            registry=state.registry,
+            faiss_store=state.faiss_store,
+        )
+        if recovery["rolled_back"] > 0 or recovery["errors"] > 0:
+            logger.warning(
+                f"WAL recovery: {recovery['rolled_back']} rolled back, "
+                f"{recovery['errors']} errors"
+            )
+        else:
+            logger.info("WAL recovery: clean (no incomplete entries)")
+
         # 加载注册表
         registry_count = state.registry.load()
         logger.info(f"Registry loaded: {registry_count} mappings")
@@ -344,6 +360,7 @@ async def upload_file(
                 continue
         new_mask.append(True)
 
+    new_sphere_ids = [chunk_sphere_ids[i] for i, m in enumerate(new_mask) if m]
     new_chunks = [chunks[i] for i, m in enumerate(new_mask) if m]
     timings["prefilter"] = time.time() - t_pre
     logger.info(
@@ -356,7 +373,6 @@ async def upload_file(
     if new_chunks:
         new_vectors = state.embedder.embed_documents(new_chunks)
     else:
-        # 全部命中缓存，无需任何嵌入
         embed_dim = state.embedder.embed_dim
         new_vectors = np.zeros((0, embed_dim), dtype=np.float32)
     timings["embed"] = time.time() - t3
@@ -366,11 +382,9 @@ async def upload_file(
         (len(chunks), state.embedder.embed_dim), dtype=np.float32
     )
     new_idx = 0
-    skipped_count = 0
     for i in range(len(chunks)):
         if i in reused_vectors:
             chunk_vectors[i] = reused_vectors[i]
-            skipped_count += 1
         else:
             chunk_vectors[i] = new_vectors[new_idx]
             new_idx += 1
@@ -380,28 +394,41 @@ async def upload_file(
     new_spheres = 0
     added_vectors: list = []
     added_ids: list = []
+    added_sphere_ids: list = []
 
-    for i, (chunk_text, vec) in enumerate(zip(chunks, chunk_vectors)):
-        sphere_id = chunk_sphere_ids[i]
-
-        if new_mask[i]:
-            # 新球体：创建 + 注册 + 收集 FAISS
-            sphere = Sphere(
-                id=sphere_id,
-                text=chunk_text,
-                source_file=file.filename,
-                source_type=source_type or (
-                    "技术笔记" if result.metadata.get("headings") else "其他"
-                ),
-                mass=1.0,
-                created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-            )
-            if state.sphere_store.add(sphere):
-                new_spheres += 1
-            faiss_id = state.registry.register(sphere_id)
-            added_vectors.append(vec)
-            added_ids.append(faiss_id)
+    for i, (sphere_id, chunk_txt, vec) in enumerate(zip(chunk_sphere_ids, chunks, chunk_vectors)):
+        if not new_mask[i]:
+            continue
+        sphere = Sphere(
+            id=sphere_id,
+            text=chunk_txt,
+            source_file=file.filename,
+            source_type=source_type or (
+                "技术笔记" if result.metadata.get("headings") else "其他"
+            ),
+            mass=1.0,
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+        if state.sphere_store.add(sphere):
+            new_spheres += 1
+        faiss_id = state.registry.register(sphere_id)
+        added_vectors.append(vec)
+        added_ids.append(faiss_id)
+        added_sphere_ids.append(sphere_id)
     timings["create_spheres"] = time.time() - t4
+
+    # ── 5.5 WAL：记录本次操作 ─────────────────
+    wal_entry = None
+    if new_spheres > 0 and auto_rebuild:
+        wal_entry = state.wal.create(
+            file_name=file.filename,
+            source_type=source_type or (
+                "技术笔记" if result.metadata.get("headings") else "其他"
+            ),
+            sphere_ids=added_sphere_ids,
+            faiss_ids=added_ids,
+            chunks_total=len(new_chunks),
+        )
 
     # ── 6. 新向量 → FAISS ─────────────────────
     t5 = time.time()
@@ -418,12 +445,31 @@ async def upload_file(
             state.field_detector.update_centroid(source_type, vec)
     timings["field_update"] = time.time() - t6
 
-    # ── 8. 持久化 ─────────────────────────────
+    # ── 8. 持久化（原子写入）───────────────────
     t7 = time.time()
     if new_spheres > 0 and auto_rebuild:
-        state.registry.save()
-        state.sphere_store.save()
-        state.faiss_store.save()
+        # 标记 WAL 为 committing（正在写盘）
+        if wal_entry:
+            state.wal.mark_committing(wal_entry)
+
+        try:
+            _atomic_save_all()
+        except Exception as e:
+            logger.error(f"Atomic save failed: {e}")
+            if wal_entry:
+                state.wal._rollback(
+                    wal_entry, state.sphere_store,
+                    state.registry, state.faiss_store
+                )
+                state.wal.mark_rolled_back(wal_entry)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Persist failed, changes rolled back: {e}"
+            )
+
+        # 标记 WAL 为 done（安全完成）
+        if wal_entry:
+            state.wal.mark_done(wal_entry)
     timings["persist"] = time.time() - t7
 
     timings["total"] = time.time() - t0
@@ -544,6 +590,34 @@ async def rebuild():
 # ──────────────────────────────────────────────
 # 内部函数
 # ──────────────────────────────────────────────
+
+def _atomic_save_all():
+    """原子地保存所有状态
+
+    JSON 文件先写 .tmp 再 rename 覆盖（同一磁盘分区内 rename 是原子操作）。
+    FAISS 索引文件直接保存（faiss.write_index 是库自己的序列化，相对安全）。
+    """
+    import shutil
+
+    for name, store, path_attr in [
+        ("registry", state.registry, "registry_map"),
+        ("spheres", state.sphere_store, "spheres_data"),
+    ]:
+        path = getattr(cfg_paths, path_attr)
+        tmp_path = path + ".tmp"
+        try:
+            store.save(tmp_path)
+            if os.path.exists(path):
+                os.remove(path)
+            shutil.move(tmp_path, path)
+            logger.info(f"  Atomic save {name}: {path}")
+        except Exception as e:
+            logger.error(f"  Atomic save FAILED {name}: {e}")
+            raise
+
+    # FAISS 有自己的序列化格式，保存到正式路径
+    state.faiss_store.save()
+
 
 def _collect_field_vectors(
     sphere_store: SphereStore,
