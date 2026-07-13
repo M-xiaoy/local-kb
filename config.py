@@ -123,6 +123,35 @@ class ClusteringConfig:
 
 
 # ──────────────────────────────────────────────
+# 答案生成配置
+# ──────────────────────────────────────────────
+@dataclass
+class GenerationConfig:
+    """多后端生成器配置
+
+    model 取值:
+      ollama   — 本地 Ollama LLM（默认 qwen2.5:7b）
+      deepseek — DeepSeek V4 Pro 云端 API
+      agent    — 扩展接口（预留，接入自定义生成服务）
+    """
+    default_model: str = "ollama"           # ollama | deepseek | agent
+
+    # --- Ollama 本地 ---
+    ollama_model: str = "qwen2.5:7b"
+    ollama_temperature: float = 0.3
+    ollama_max_tokens: int = 2048
+    ollama_timeout: int = 120
+
+    # --- DeepSeek 云端 ---
+    deepseek_api_key: str = ""               # 从环境变量读取，或手动填
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-v4-pro"
+    deepseek_temperature: float = 0.3
+    deepseek_max_tokens: int = 2048
+    deepseek_timeout: int = 60
+
+
+# ──────────────────────────────────────────────
 # 场域配置（已迁移至聚类自动发现）
 # ──────────────────────────────────────────────
 # 此列表不再作为场域定义，仅用于：
@@ -147,3 +176,4 @@ chunker = ChunkerConfig()
 retrieval = RetrievalConfig()
 web = WebConfig()
 clustering = ClusteringConfig()
+generation = GenerationConfig()

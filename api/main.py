@@ -41,6 +41,7 @@ from retrieval.diversity_sorter import DiversitySorter
 from retrieval.retriever import Retriever, RetrievalResult
 from retrieval.session_manager import SessionManager
 from retrieval.cluster_engine import ClusterEngine
+from pipeline.generator import AnswerGenerator, get_generator
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +244,67 @@ function resetFocus() {
   }
 }
 
+// 加载可用后端
+async function loadBackends() {
+  try {
+    const backends = await fetch("/backends").then(r => r.json());
+    const sel = document.getElementById("model-select");
+    for (const opt of sel.options) {
+      if (!backends.available[opt.value]) {
+        opt.disabled = true;
+        opt.text += " (不可用)";
+      }
+    }
+  } catch(e) {}
+}
+
+// 问答
+async function ask() {
+  const q = document.getElementById("query-input").value.trim();
+  if (!q) return;
+  
+  document.getElementById("ask-btn").disabled = true;
+  document.getElementById("answer-area").style.display = "block";
+  document.getElementById("answer-text").textContent = "生成中...";
+  document.getElementById("answer-error").style.display = "none";
+  
+  try {
+    const payload = {
+      query: q,
+      model: document.getElementById("model-select").value,
+      top_k: 5,
+    };
+    
+    const data = await api("/ask", payload);
+    
+    document.getElementById("answer-model").textContent = "模型: " + (data.backend || "?") + " (" + (data.model || "?") + ")";
+    document.getElementById("answer-timing").textContent = "生成 " + (data.generation_ms || 0).toFixed(0) + "ms / 检索 " + ((data.retrieval_ms && data.retrieval_ms.total) || 0).toFixed(0) + "ms";
+    
+    if (data.error) {
+      document.getElementById("answer-text").textContent = "生成失败: " + data.error;
+      document.getElementById("answer-error").style.display = "inline";
+      document.getElementById("answer-error").textContent = "错误";
+    } else {
+      document.getElementById("answer-text").textContent = data.answer || "(无回答)";
+    }
+    
+    // 显示检索到的上下文
+    if (data.results && data.results.length > 0) {
+      let html = "<div style='margin-top:16px;font-size:12px;color:#666;'>参考上下文:</div>";
+      for (const item of data.results) {
+        html += `<div class="result-card"><div class="meta"><span class="badge badge-score">${(item.score || 0).toFixed(3)}</span><span class="badge badge-field">${item.source_type || "?"}</span></div><div class="text">${escapeHtml(item.text)}</div></div>`;
+      }
+      document.getElementById("results").innerHTML = html;
+    }
+  } catch(e) {
+    document.getElementById("answer-text").textContent = "请求失败: " + e.message;
+  }
+  document.getElementById("ask-btn").disabled = false;
+}
+
+// 页面加载时检查后端状态
+loadBackends();
+
 async function uploadFile() {
   const fileInput = document.getElementById("file-upload");
   const file = fileInput.files[0];
@@ -414,6 +476,7 @@ class AppState:
         self.wal = WalManager(str(Path(cfg_paths.wal_dir)))
         self.sessions = SessionManager()
         self.cluster_engine = ClusterEngine()
+        self.generator = AnswerGenerator()
 
     def is_loaded(self) -> bool:
         return self.faiss_store.is_built
@@ -452,6 +515,28 @@ class UploadResponse(BaseModel):
     chunks: int
     new_spheres: int
     timing_ms: dict
+
+
+class AskRequest(BaseModel):
+    query: str
+    model: str = ""                         # 空=用配置默认值
+    top_k: int = 5
+    field_focus: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class AskResponse(BaseModel):
+    query: str
+    answer: str
+    model: str
+    backend: str
+    generation_ms: float
+    results: List[dict]
+    field_affinities: dict
+    retrieval_ms: dict
+    session_id: Optional[str] = None
+    focus_field: Optional[str] = None
+    error: Optional[str] = None
 
 
 class StatusResponse(BaseModel):
@@ -968,10 +1053,90 @@ async def query(request: QueryRequest):
         ],
         field_affinities={k: float(v) for k, v in result.field_affinities.items()},
         total_spheres=result.total_count,
-        timing_ms={k: round(v * 1000, 1) for k, v in result.timing.items()},
+        timing_ms={k: float(round(v * 1000, 1)) for k, v in result.timing.items()},
         session_id=session.session_id if session else None,
         focus_field=effective_focus if effective_focus else None,
     )
+
+
+# ──────────────────────────────────────────────
+# 端点：问答
+# ──────────────────────────────────────────────
+
+@app.post("/ask")
+async def ask(request: AskRequest):
+    """检索上下文并生成回答
+
+    先走完整检索流程，再根据选择的模型生成回答。
+    支持 model=ollama|deepseek|agent（空=配置默认）。
+    """
+    if not state.is_loaded():
+        raise HTTPException(status_code=400, detail="Knowledge base is empty. Upload files first.")
+
+    # 1. 检索上下文
+    retrieval_result: RetrievalResult = state.retriever.retrieve(
+        query=request.query,
+        top_k=request.top_k,
+        field_focus=request.field_focus,
+    )
+
+    # 2. 提取上下文文本
+    context_texts = [s.text for s in retrieval_result.spheres]
+    context_spheres = [
+        {
+            "text": s.text[:200] + "..." if len(s.text) > 200 else s.text,
+            "source_file": s.source_file,
+            "source_type": s.source_type,
+            "score": round(retrieval_result.scores[i], 4) if i < len(retrieval_result.scores) else 0.0,
+            "cluster_id": s.cluster_id,
+        }
+        for i, s in enumerate(retrieval_result.spheres)
+    ]
+
+    # 3. 生成回答
+    model_name = request.model or None  # None = config default
+    answer_result = state.generator.generate(
+        query=request.query,
+        context_texts=context_texts,
+        model=model_name,
+        context_spheres=context_spheres,
+    )
+
+    # 构造响应（手动转换所有值为 Python 原生类型，避免 numpy 序列化问题）
+    response_data = {
+        "query": str(request.query),
+        "answer": str(answer_result.text) if answer_result.text else "",
+        "model": str(answer_result.model) if answer_result.model else "",
+        "backend": str(answer_result.backend) if answer_result.backend else "",
+        "generation_ms": float(round(answer_result.timing_ms, 1)) if answer_result.timing_ms else 0.0,
+        "results": [
+            {
+                "text": str(r.get("text", "")),
+                "source_file": str(r.get("source_file", "")),
+                "source_type": str(r.get("source_type", "")),
+                "score": float(r.get("score", 0.0)),
+                "cluster_id": int(r.get("cluster_id", -1)),
+            }
+            for r in context_spheres
+        ],
+        "field_affinities": {str(k): float(v) for k, v in retrieval_result.field_affinities.items()},
+        "retrieval_ms": {str(k): float(round(v * 1000, 1)) for k, v in retrieval_result.timing.items()},
+        "error": str(answer_result.error) if answer_result.error else None,
+    }
+    return JSONResponse(content=response_data)
+
+
+# ──────────────────────────────────────────────
+# 端点：后端列表
+# ──────────────────────────────────────────────
+
+@app.get("/backends")
+async def list_backends():
+    """列出可用的生成后端"""
+    gen = get_generator()
+    backends = gen.list_backends()
+    available = {k: gen.is_available(k) for k in backends}
+    return {"backends": backends, "available": available, "default": "ollama"}
 
 
 # ──────────────────────────────────────────────

@@ -11,6 +11,10 @@ data/spheres/
 data/uploads/
 data/wal/
 data/clusters/
+data_backup_*/
+
+# Runtime
+.kb_pid
 
 # Logs
 *.log
