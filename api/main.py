@@ -11,6 +11,7 @@ main.py — 重力知识库 FastAPI 应用
   uvicorn api.main:app --reload --port 8765
 """
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -854,7 +855,10 @@ async def startup():
 
                     if len(vectors) >= 2:
                         vectors_arr = np.stack(vectors, axis=0)
-                        centroids, labels, _ = state.cluster_engine.fit_predict(vectors_arr)
+                        loop = asyncio.get_event_loop()
+                        centroids, labels, _ = await loop.run_in_executor(
+                            None, state.cluster_engine.fit_predict, vectors_arr
+                        )
 
                         k = centroids.shape[0]
                         label_map = {i: f"簇{i}" for i in range(k)}
@@ -1138,7 +1142,11 @@ async def upload_file(
 
                 if len(vectors) >= 2:
                     vectors_arr = np.stack(vectors, axis=0)
-                    centroids, labels, scores = state.cluster_engine.fit_predict(vectors_arr)
+                    # run_in_executor 避免阻塞事件循环（sklearn KMeans 是同步的）
+                    loop = asyncio.get_event_loop()
+                    centroids, labels, scores = await loop.run_in_executor(
+                        None, state.cluster_engine.fit_predict, vectors_arr
+                    )
 
                     # 更新每个球体的 cluster_id + gravity_field
                     k = centroids.shape[0]
