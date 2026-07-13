@@ -57,277 +57,475 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>重力知识库</title>
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f1a; color: #e0e0e0; min-height: 100vh; }
-.container { max-width: 900px; margin: 0 auto; padding: 24px 16px; }
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
+    background: #f8f9fb; color: #1e293b; min-height: 100vh;
+  }
+  .container { max-width: 720px; margin: 0 auto; padding: 0 20px; }
 
-/* 顶部 */
-.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
-.header h1 { font-size: 20px; font-weight: 600; }
-.header .subtitle { color: #888; font-size: 13px; margin-top: 2px; }
-.header-right { text-align: right; font-size: 12px; color: #666; }
+  /* Header */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 0; border-bottom: 1px solid #e9eef2;
+  }
+  .header-left { display: flex; align-items: center; gap: 10px; }
+  .header-logo { font-size: 18px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; }
+  .header-logo span { color: #6366f1; }
+  .header-sub { font-size: 12px; color: #94a3b8; margin-top: 1px; }
+  .header-right { font-size: 12px; color: #94a3b8; text-align: right; }
 
-/* 搜索 */
-.search-area { margin-bottom: 16px; }
-.search-row { display: flex; gap: 8px; }
-.search-row input { flex: 1; padding: 10px 14px; border: 1px solid #2a2a3a; border-radius: 8px; background: #1a1a2e; color: #e0e0e0; font-size: 14px; outline: none; }
-.search-row input:focus { border-color: #4a4a8a; }
-.search-row button { padding: 10px 20px; border: none; border-radius: 8px; background: #4a4a8a; color: #fff; font-size: 14px; cursor: pointer; }
-.search-row button:hover { background: #5a5a9a; }
-.search-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Hero search */
+  .hero { padding: 60px 0 32px; text-align: center; }
+  .hero h2 { font-size: 24px; font-weight: 600; color: #0f172a; margin-bottom: 6px; }
+  .hero p { font-size: 14px; color: #64748b; margin-bottom: 28px; }
+  .search-box {
+    display: flex; align-items: center;
+    max-width: 560px; margin: 0 auto;
+    background: #fff; border: 1px solid #e2e8f0;
+    border-radius: 12px; padding: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.02);
+    transition: box-shadow 0.2s, border-color 0.2s;
+  }
+  .search-box:focus-within {
+    border-color: #a5b4fc;
+    box-shadow: 0 1px 3px rgba(99,102,241,0.06), 0 4px 20px rgba(99,102,241,0.08);
+  }
+  .search-box input {
+    flex: 1; border: none; outline: none;
+    padding: 12px 16px; font-size: 15px; color: #1e293b;
+    background: transparent;
+  }
+  .search-box input::placeholder { color: #94a3b8; }
+  .search-box .actions { display: flex; gap: 6px; padding-right: 4px; }
+  .search-box select {
+    border: none; outline: none; background: #f1f5f9;
+    padding: 6px 10px; border-radius: 8px;
+    font-size: 12px; color: #475569; cursor: pointer;
+  }
+  .search-box select:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn {
+    padding: 8px 16px; border: none; border-radius: 8px;
+    font-size: 13px; font-weight: 500; cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+  }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: #6366f1; color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: #4f46e5; }
+  .btn-success { background: #10b981; color: #fff; }
+  .btn-success:hover:not(:disabled) { background: #059669; }
 
-/* 场域聚焦栏 */
-.focus-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-.focus-bar .label { font-size: 12px; color: #888; margin-right: 4px; }
-.focus-btn { padding: 4px 12px; border: 1px solid #2a2a3a; border-radius: 12px; background: transparent; color: #888; font-size: 12px; cursor: pointer; }
-.focus-btn:hover { border-color: #4a4a8a; color: #aaa; }
-.focus-btn.active { background: #4a4a8a; border-color: #4a4a8a; color: #fff; }
-.focus-btn.active:hover { background: #5a5a9a; }
-.focus-btn.exit { border-color: #8a3a3a; color: #8a3a3a; }
+  /* Toolbar */
+  .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; padding: 0 4px; }
+  .toolbar-label { font-size: 12px; color: #94a3b8; margin-right: 4px; }
+  .pill {
+    padding: 4px 14px; border: 1px solid #e2e8f0; border-radius: 20px;
+    background: #fff; color: #64748b; font-size: 12px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .pill:hover { border-color: #c7d2fe; color: #6366f1; }
+  .pill.active { background: #6366f1; border-color: #6366f1; color: #fff; }
+  .pill.exit { border-color: #fecaca; color: #ef4444; }
+  .pill.exit:hover { background: #fef2f2; }
 
-/* 结果 */
-.result-card { background: #1a1a2e; border: 1px solid #2a2a3a; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
-.result-card .meta { display: flex; gap: 8px; font-size: 11px; color: #666; margin-bottom: 6px; flex-wrap: wrap; }
-.result-card .meta .badge { padding: 1px 6px; border-radius: 4px; font-size: 10px; }
-.badge-cluster { background: #2a2a4a; color: #8a8acc; }
-.badge-field { background: #2a2a3a; color: #888; }
-.badge-score { background: #1a2a1a; color: #6a8; }
-.result-card .text { font-size: 13px; line-height: 1.6; color: #ccc; max-height: 150px; overflow-y: auto; }
-.result-card .gf { font-size: 10px; color: #555; margin-top: 6px; }
+  /* Answer card */
+  .answer-card {
+    background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%);
+    border: 1px solid #a7f3d0; border-radius: 12px;
+    padding: 16px 20px; margin-bottom: 16px;
+  }
+  .answer-meta { font-size: 11px; color: #6ee7b7; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; }
+  .answer-meta .label { color: #94a3b8; }
+  .answer-text { font-size: 14px; line-height: 1.7; color: #065f46; white-space: pre-wrap; }
+  .answer-error { color: #ef4444; font-size: 13px; }
 
-/* 状态 */
-.status-bar { font-size: 12px; color: #555; margin-bottom: 16px; }
+  /* Result card */
+  .result-card {
+    background: #fff; border: 1px solid #e9eef2; border-radius: 10px;
+    padding: 14px 18px; margin-bottom: 8px;
+    transition: border-color 0.15s;
+  }
+  .result-card:hover { border-color: #cbd5e1; }
+  .result-meta {
+    display: flex; gap: 8px; font-size: 11px; color: #94a3b8;
+    margin-bottom: 6px; flex-wrap: wrap; align-items: center;
+  }
+  .badge { padding: 1px 8px; border-radius: 4px; font-size: 10px; font-weight: 500; }
+  .badge-cluster { background: #eef2ff; color: #6366f1; }
+  .badge-field { background: #f1f5f9; color: #64748b; }
+  .badge-score { background: #ecfdf5; color: #059669; }
+  .result-text {
+    font-size: 13px; line-height: 1.6; color: #475569;
+    max-height: 120px; overflow-y: auto;
+  }
+  .result-gf { font-size: 10px; color: #cbd5e1; margin-top: 6px; }
 
-/* 上传区 */
-.upload-area { margin-top: 32px; padding: 16px; border: 1px dashed #2a2a3a; border-radius: 8px; text-align: center; }
-.upload-area input { display: none; }
-.upload-area label { display: inline-block; padding: 6px 14px; border-radius: 6px; background: #2a2a3a; color: #888; font-size: 12px; cursor: pointer; }
-.upload-area label:hover { background: #3a3a4a; }
-.upload-status { font-size: 12px; color: #666; margin-top: 8px; }
+  /* Status bar */
+  .status-bar { font-size: 11px; color: #cbd5e1; margin-bottom: 16px; padding: 0 4px; }
 
-.loading { opacity: 0.5; }
-.empty { color: #666; font-size: 13px; text-align: center; padding: 32px; }
+  /* Upload */
+  .upload-area {
+    margin: 40px 0 32px; padding: 20px;
+    border: 1px dashed #d1d5db; border-radius: 10px;
+    text-align: center; background: #fafbfc;
+  }
+  .upload-area label {
+    display: inline-block; padding: 6px 18px;
+    border-radius: 20px; background: #fff; color: #64748b;
+    border: 1px solid #e2e8f0; font-size: 12px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .upload-area label:hover { border-color: #6366f1; color: #6366f1; }
+  .upload-area input { display: none; }
+  .upload-status { font-size: 11px; color: #94a3b8; margin-top: 8px; }
+
+  /* Empty state */
+  .empty-state { text-align: center; padding: 48px 0; color: #94a3b8; }
+  .empty-state .icon { font-size: 32px; margin-bottom: 8px; }
+  .empty-state p { font-size: 13px; }
+
+  /* Loading */
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .loading { animation: pulse 1.5s ease-in-out infinite; color: #94a3b8; text-align: center; padding: 32px; font-size: 13px; }
+
+  /* Section title */
+  .section-title { font-size: 12px; font-weight: 600; color: #94a3b8; margin: 20px 0 10px; padding: 0 4px; }
 </style>
 </head>
 <body>
-<div class="container" id="app">
+<div class="container">
+  <!-- Header -->
   <div class="header">
-    <div>
-      <h1>✦ 重力知识库</h1>
-      <div class="subtitle">FAISS + 引力场路由 + 自动聚类</div>
+    <div class="header-left">
+      <div class="header-logo"><span>✦</span> 重力知识库</div>
+      <div class="header-sub">FAISS + 重力场路由 + 自动聚类</div>
     </div>
-    <div class="header-right" id="status-info">
-      <div id="sphere-count">加载中...</div>
+    <div class="header-right" id="sphere-count">加载中...</div>
+  </div>
+
+  <!-- Hero -->
+  <div class="hero">
+    <h2>搜索你的知识库</h2>
+    <p>自动聚类 · 引力场路由 · 多模型问答</p>
+    <div class="search-box">
+      <input id="query-input" type="text" placeholder="Enter 搜索 · Shift+Enter 问答" autofocus>
+      <div class="actions">
+        <select id="model-select">
+          <option value="ollama">Ollama</option>
+          <option value="deepseek">DeepSeek</option>
+        </select>
+        <button class="btn btn-primary" id="search-btn" onclick="search()">搜索</button>
+        <button class="btn btn-success" id="ask-btn" onclick="ask()">问答</button>
+      </div>
     </div>
   </div>
 
-  <div class="search-area">
-    <div class="search-row">
-      <input id="query-input" type="text" placeholder="搜索知识库..." onkeydown="if(event.key==='Enter') search()">
-      <button id="search-btn" onclick="search()">搜索</button>
-    </div>
+  <!-- Toolbar -->
+  <div class="toolbar" id="toolbar">
+    <span class="toolbar-label">聚焦</span>
+    <span id="focus-pills"></span>
+    <button class="pill exit" id="exit-focus" style="display:none" onclick="resetFocus()">x 清除</button>
   </div>
 
-  <div class="focus-bar" id="focus-bar">
-    <span class="label">聚焦:</span>
-    <span id="focus-buttons"></span>
-    <button class="focus-btn exit" id="exit-focus" style="display:none" onclick="resetFocus()">× 退出聚焦</button>
-  </div>
-
+  <!-- Status -->
   <div class="status-bar" id="session-info"></div>
 
+  <!-- Answer -->
+  <div class="answer-card" id="answer-area" style="display:none">
+    <div class="answer-meta">
+      <span id="answer-model"></span>
+      <span id="answer-timing"></span>
+      <span class="answer-error" id="answer-error" style="display:none"></span>
+    </div>
+    <div class="answer-text" id="answer-text"></div>
+  </div>
+
+  <!-- Results -->
+  <div class="section-title" id="results-title" style="display:none">检索结果</div>
   <div id="results"></div>
 
+  <!-- Upload -->
   <div class="upload-area">
-    <label for="file-upload">📄 上传文件</label>
+    <label for="file-upload">+ 上传文件（PDF / DOCX / MD / TXT）</label>
     <input type="file" id="file-upload" onchange="uploadFile()">
     <div class="upload-status" id="upload-status"></div>
   </div>
 </div>
 
 <script>
-let sessionId = localStorage.getItem("gravity_session") || null;
-let currentFocus = null;
+// State
+var sessionId = localStorage.getItem("gravity_session") || null;
+var currentFocus = null;
+var requestId = 0;        // request dedup counter
+var busy = false;         // global busy lock
 
+// Keyboard shortcuts
+document.getElementById("query-input").addEventListener("keydown", function(e) {
+  if (e.key === "Enter") {
+    if (e.shiftKey) { ask(); } else { search(); }
+  }
+});
+
+// API call with error resilience
 async function api(path, body) {
-  const res = await fetch(path, {
+  var res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error((await res.json()).message || res.statusText);
-  return res.json();
+  var text = await res.text();  // always read as text first
+  if (!res.ok) {
+    throw new Error(path + " (HTTP " + res.status + "): " + text.slice(0, 300));
+  }
+  try {
+    return JSON.parse(text);
+  } catch(e) {
+    throw new Error(path + ": not JSON: " + text.slice(0, 200));
+  }
 }
 
+// Status
 async function loadStatus() {
   try {
-    const s = await fetch("/status").then(r => r.json());
-    document.getElementById("sphere-count").textContent = s.active_spheres + " 球体 · " + s.fields.length + " 场域";
-    renderFocusButtons(s.fields.map((f, i) => ({ name: f, count: s.field_counts[f] || 0 })));
+    var res = await fetch("/status");
+    var text = await res.text();
+    var s = JSON.parse(text);
+    document.getElementById("sphere-count").textContent =
+      s.active_spheres + " spheres \u00b7 " + s.fields.length + " fields";
+    var fields = [];
+    for (var key in s.field_counts) {
+      fields.push({ name: key, count: s.field_counts[key] });
+    }
+    renderPills(fields);
   } catch(e) {
-    document.getElementById("sphere-count").textContent = "连接失败";
+    document.getElementById("sphere-count").textContent = "connection failed";
   }
 }
 
-function renderFocusButtons(fields) {
-  let html = "";
-  for (const f of fields) {
-    const active = currentFocus === f.name ? "active" : "";
-    html += `<button class="focus-btn ${active}" onclick="setFocus('${f.name}')">${f.name}</button> `;
+function renderPills(fields) {
+  var html = "";
+  for (var i = 0; i < fields.length; i++) {
+    var f = fields[i];
+    var active = (currentFocus === f.name) ? "active" : "";
+    html += "<button class=\"pill " + active + "\" onclick=\"setFocus('" + f.name + "')\">" + f.name + "</button> ";
   }
-  document.getElementById("focus-buttons").innerHTML = html;
+  document.getElementById("focus-pills").innerHTML = html;
   document.getElementById("exit-focus").style.display = currentFocus ? "inline-block" : "none";
 }
 
+// Search with request dedup
 async function search() {
-  const q = document.getElementById("query-input").value.trim();
+  if (busy) { showError("results", "Please wait for current request"); return; }
+  var q = document.getElementById("query-input").value.trim();
   if (!q) return;
-  
+
+  busy = true;
+  var myReq = ++requestId;
   document.getElementById("search-btn").disabled = true;
-  document.getElementById("results").innerHTML = "<div class='loading'>搜索中...</div>";
-  
+  document.getElementById("results").innerHTML = "<div class=\"loading\">searching...</div>";
+  document.getElementById("results-title").style.display = "block";
+  document.getElementById("answer-area").style.display = "none";
+  document.getElementById("query-input").focus();
+
   try {
-    const payload = { query: q, top_k: 5 };
+    var payload = { query: q, top_k: 5 };
     if (sessionId) payload.session_id = sessionId;
     if (currentFocus) payload.field_focus = currentFocus;
-    
-    const data = await api("/query", payload);
+
+    var data = await api("/query", payload);
+    if (myReq !== requestId) return;  // stale, discard
+
     sessionId = data.session_id;
     if (sessionId) localStorage.setItem("gravity_session", sessionId);
-    
     renderResults(data);
-    document.getElementById("session-info").textContent = "会话: " + sessionId.slice(0, 8) + "...";
+    var sid = data.session_id || "";
+    document.getElementById("session-info").textContent =
+      "session " + sid.slice(0, 8) + "...";
   } catch(e) {
-    document.getElementById("results").innerHTML = "<div class='empty'>错误: " + e.message + "</div>";
+    if (myReq === requestId) { showError("results", e.message); }
   }
   document.getElementById("search-btn").disabled = false;
+  busy = false;
 }
 
 function renderResults(data) {
-  const r = data.results;
+  var r = data.results;
   if (!r || r.length === 0) {
-    document.getElementById("results").innerHTML = "<div class='empty'>无结果</div>";
+    document.getElementById("results").innerHTML =
+      "<div class=\"empty-state\"><div class=\"icon\">&#x1f50d;</div><p>No results found</p></div>";
     return;
   }
-  let html = "";
-  for (const item of r) {
-    const text = item.text;
-    const gf = item.gravity_field ? Object.entries(item.gravity_field).map(([k,v]) => `${k}:${v.toFixed(2)}`).join(" ") : "";
-    html += `<div class="result-card">`;
-    html += `<div class="meta">`;
-    html += `<span class="badge badge-cluster">簇${item.cluster_id}</span>`;
-    html += `<span class="badge badge-field">${item.source_type || "?"}</span>`;
-    html += `<span class="badge badge-score">${item.score.toFixed(3)}</span>`;
-    html += `</div>`;
-    html += `<div class="text">${escapeHtml(text)}</div>`;
-    if (gf) html += `<div class="gf">${gf}</div>`;
-    html += `</div>`;
+  var html = "";
+  if (data.field_affinities) {
+    var affs = Object.entries(data.field_affinities);
+    if (affs.length > 0) {
+      html += "<div class=\"status-bar\">Field affinity: " +
+        affs.map(function(a) { return a[0] + " " + a[1].toFixed(2); }).join(" \u00b7 ") + "</div>";
+    }
+  }
+  for (var i = 0; i < r.length; i++) {
+    var item = r[i];
+    html += "<div class=\"result-card\">";
+    html += "<div class=\"result-meta\">";
+    html += "<span class=\"badge badge-cluster\">" + (item.source_type || "cluster" + item.cluster_id) + "</span>";
+    html += "<span class=\"badge badge-score\">" + (item.score || 0).toFixed(3) + "</span>";
+    if (item.source_file) {
+      html += "<span style=\"color:#cbd5e1\">" + escapeHtml(item.source_file) + "</span>";
+    }
+    html += "</div>";
+    html += "<div class=\"result-text\">" + escapeHtml(item.text) + "</div>";
+    html += "</div>";
   }
   document.getElementById("results").innerHTML = html;
 }
 
-function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function showError(id, msg) {
+  document.getElementById(id).innerHTML =
+    "<div class=\"empty-state\"><p>&#x2716; " + escapeHtml(msg) + "</p></div>";
+}
 
+function escapeHtml(s) {
+  if (!s) return "";
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Focus controls
 function setFocus(field) {
   currentFocus = field;
-  renderFocusButtons([]);
+  renderPills([]);
   loadStatus();
-  if (document.getElementById("query-input").value.trim()) search();
+  var q = document.getElementById("query-input").value.trim();
+  if (q) search();
 }
 
 function resetFocus() {
   currentFocus = null;
-  renderFocusButtons([]);
+  renderPills([]);
   loadStatus();
-  if (sessionId) {
-    api("/query", { query: ".", top_k: 1, session_id: sessionId, reset_focus: true }).then(() => {});
-  }
 }
 
-// 加载可用后端
+// Backend availability
 async function loadBackends() {
   try {
-    const backends = await fetch("/backends").then(r => r.json());
-    const sel = document.getElementById("model-select");
-    for (const opt of sel.options) {
+    var res = await fetch("/backends");
+    var text = await res.text();
+    var backends = JSON.parse(text);
+    var sel = document.getElementById("model-select");
+    for (var i = 0; i < sel.options.length; i++) {
+      var opt = sel.options[i];
       if (!backends.available[opt.value]) {
         opt.disabled = true;
-        opt.text += " (不可用)";
+        opt.textContent += " (offline)";
       }
     }
   } catch(e) {}
 }
 
-// 问答
+// Ask
 async function ask() {
-  const q = document.getElementById("query-input").value.trim();
+  if (busy) { showError("results", "Please wait for current request"); return; }
+  var q = document.getElementById("query-input").value.trim();
   if (!q) return;
-  
+
+  busy = true;
+  var myReq = ++requestId;
   document.getElementById("ask-btn").disabled = true;
-  document.getElementById("answer-area").style.display = "block";
-  document.getElementById("answer-text").textContent = "生成中...";
+  document.getElementById("results-title").style.display = "block";
+  document.getElementById("query-input").focus();
+
+  // Clear previous answer
+  var area = document.getElementById("answer-area");
+  area.style.display = "block";
+  document.getElementById("answer-text").textContent = "Generating...";
+  document.getElementById("answer-text").className = "answer-text";
   document.getElementById("answer-error").style.display = "none";
-  
+  document.getElementById("results").innerHTML = "";
+
   try {
-    const payload = {
+    var payload = {
       query: q,
       model: document.getElementById("model-select").value,
       top_k: 5,
     };
-    
-    const data = await api("/ask", payload);
-    
-    document.getElementById("answer-model").textContent = "模型: " + (data.backend || "?") + " (" + (data.model || "?") + ")";
-    document.getElementById("answer-timing").textContent = "生成 " + (data.generation_ms || 0).toFixed(0) + "ms / 检索 " + ((data.retrieval_ms && data.retrieval_ms.total) || 0).toFixed(0) + "ms";
-    
-    if (data.error) {
-      document.getElementById("answer-text").textContent = "生成失败: " + data.error;
-      document.getElementById("answer-error").style.display = "inline";
-      document.getElementById("answer-error").textContent = "错误";
-    } else {
-      document.getElementById("answer-text").textContent = data.answer || "(无回答)";
+    if (sessionId) payload.session_id = sessionId;
+
+    var data = await api("/ask", payload);
+    if (myReq !== requestId) return;  // stale, discard
+
+    // Track session for follow-ups
+    if (data.session_id) {
+      sessionId = data.session_id;
+      localStorage.setItem("gravity_session", sessionId);
     }
-    
-    // 显示检索到的上下文
+
+    document.getElementById("answer-model").innerHTML =
+      "<span class=\"label\">&#x1f916;</span> " + (data.backend || "?") +
+      " <span style=\"color:#94a3b8\">" + (data.model || "") + "</span>";
+    document.getElementById("answer-timing").innerHTML =
+      "<span class=\"label\">&#x26a1;</span> gen " + (data.generation_ms || 0).toFixed(0) + "ms" +
+      " <span style=\"color:#94a3b8\">\u00b7 search " +
+      ((data.retrieval_ms && data.retrieval_ms.total) || 0).toFixed(0) + "ms</span>";
+
+    if (data.error) {
+      document.getElementById("answer-text").className = "answer-error";
+      document.getElementById("answer-text").textContent = "&#x2716; " + data.error;
+    } else {
+      document.getElementById("answer-text").textContent = data.answer || "(no answer)";
+      document.getElementById("session-info").textContent = "session " + (data.session_id || "").slice(0, 8) + "...";
+    }
+
     if (data.results && data.results.length > 0) {
-      let html = "<div style='margin-top:16px;font-size:12px;color:#666;'>参考上下文:</div>";
-      for (const item of data.results) {
-        html += `<div class="result-card"><div class="meta"><span class="badge badge-score">${(item.score || 0).toFixed(3)}</span><span class="badge badge-field">${item.source_type || "?"}</span></div><div class="text">${escapeHtml(item.text)}</div></div>`;
+      var html = "<div class=\"section-title\">Reference context</div>";
+      for (var i = 0; i < data.results.length; i++) {
+        var item = data.results[i];
+        html += "<div class=\"result-card\"><div class=\"result-meta\">";
+        html += "<span class=\"badge badge-score\">" + (item.score || 0).toFixed(3) + "</span>";
+        html += "<span class=\"badge badge-field\">" + escapeHtml(item.source_type || "") + "</span>";
+        html += "</div><div class=\"result-text\">" + escapeHtml(item.text) + "</div></div>";
       }
       document.getElementById("results").innerHTML = html;
     }
   } catch(e) {
-    document.getElementById("answer-text").textContent = "请求失败: " + e.message;
+    if (myReq === requestId) {
+      document.getElementById("answer-text").className = "answer-error";
+      document.getElementById("answer-text").textContent = "&#x2716; " + e.message;
+    }
   }
   document.getElementById("ask-btn").disabled = false;
+  busy = false;
 }
 
-// 页面加载时检查后端状态
-loadBackends();
-
+// Upload
 async function uploadFile() {
-  const fileInput = document.getElementById("file-upload");
-  const file = fileInput.files[0];
+  if (busy) { showError("results", "Please wait"); return; }
+  var fileInput = document.getElementById("file-upload");
+  var file = fileInput.files[0];
   if (!file) return;
-  
-  const status = document.getElementById("upload-status");
-  status.textContent = "上传中...";
-  
-  const form = new FormData();
+
+  busy = true;
+  var statusEl = document.getElementById("upload-status");
+  statusEl.textContent = "&#x2191; Uploading... (" + (file.size / 1024).toFixed(0) + "KB)";
+
+  var form = new FormData();
   form.append("file", file);
   form.append("source_type", "");
-  
+
   try {
-    const res = await fetch("/upload", { method: "POST", body: form });
-    const data = await res.json();
-    status.textContent = "已上传: " + data.new_spheres + " 新球体 (" + data.timing_ms.total.toFixed(0) + "ms)";
+    var res = await fetch("/upload", { method: "POST", body: form });
+    var text = await res.text();
+    if (!res.ok) throw new Error(text.slice(0, 200));
+    var data = JSON.parse(text);
+    statusEl.textContent = "&#x2713; " + data.new_spheres + " new spheres (" + data.timing_ms.total.toFixed(0) + "ms)";
     loadStatus();
   } catch(e) {
-    status.textContent = "上传失败: " + e.message;
+    statusEl.textContent = "&#x2716; Upload failed: " + e.message;
   }
+  busy = false;
   fileInput.value = "";
 }
 
+// Init
+loadBackends();
 loadStatus();
 </script>
 </body>
@@ -689,6 +887,9 @@ async def startup():
                 except Exception as e:
                     logger.warning(f"Initial clustering failed: {e}")
 
+        # WAL 清理：删除 7 天前的已完成/已回滚条目
+        state.wal.clean_old_entries(max_age_hours=24 * 7)
+
         if faiss_count > 0 and sphere_count > 0:
             logger.info("Knowledge base loaded successfully")
         else:
@@ -972,6 +1173,13 @@ async def upload_file(
 
     timings["total"] = time.time() - t0
 
+    # 清理：上传成功后删除原始文件
+    try:
+        if file_path.exists():
+            file_path.unlink()
+    except Exception as e:
+        logger.warning(f"Failed to delete uploaded file {file.filename}: {e}")
+
     return UploadResponse(
         file=file.filename,
         file_type=result.file_type,
@@ -1073,6 +1281,10 @@ async def ask(request: AskRequest):
     if not state.is_loaded():
         raise HTTPException(status_code=400, detail="Knowledge base is empty. Upload files first.")
 
+    # 0. 会话管理 + 对话历史
+    session = state.sessions.get_or_create(request.session_id)
+    history_text = session.history_text
+
     # 1. 检索上下文
     retrieval_result: RetrievalResult = state.retriever.retrieve(
         query=request.query,
@@ -1093,14 +1305,19 @@ async def ask(request: AskRequest):
         for i, s in enumerate(retrieval_result.spheres)
     ]
 
-    # 3. 生成回答
+    # 3. 生成回答（带上对话历史）
     model_name = request.model or None  # None = config default
     answer_result = state.generator.generate(
         query=request.query,
         context_texts=context_texts,
         model=model_name,
         context_spheres=context_spheres,
+        history=history_text,
     )
+
+    # 4. 记录问答到会话历史
+    if answer_result.text and not answer_result.error:
+        session.add_history(request.query, answer_result.text)
 
     # 构造响应（手动转换所有值为 Python 原生类型，避免 numpy 序列化问题）
     response_data = {
@@ -1121,6 +1338,7 @@ async def ask(request: AskRequest):
         ],
         "field_affinities": {str(k): float(v) for k, v in retrieval_result.field_affinities.items()},
         "retrieval_ms": {str(k): float(round(v * 1000, 1)) for k, v in retrieval_result.timing.items()},
+        "session_id": session.session_id,
         "error": str(answer_result.error) if answer_result.error else None,
     }
     return JSONResponse(content=response_data)
