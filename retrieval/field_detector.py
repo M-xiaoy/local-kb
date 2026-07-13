@@ -36,7 +36,13 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 
 class FieldDetector:
-    """给定查询向量，检测其对每个已知场域的亲和度"""
+    """给定查询向量，检测其对每个已知场域的亲和度
+
+    gravity_field 维护：
+      每个球体入库时调用 compute_gravity_field() 预计算到各质心的距离。
+      质心变化时调用 rebuild_all_gravity_fields() 全量同步。
+      对查询而言，gravity_field 是缓存——可直接读，不重新算。
+    """
 
     def __init__(self, dim: Optional[int] = None):
         self.dim = dim or cfg_ollama.embed_dim
@@ -188,6 +194,127 @@ class FieldDetector:
             return ("", 0.0)
         best = next(iter(scores.items()))
         return best
+
+    # ── gravity_field 维护 ─────────────────────
+
+    def compute_gravity_field(
+        self, vector: np.ndarray
+    ) -> Dict[str, float]:
+        """计算一个球体到所有场域质心的引力值
+
+        输入：球体的嵌入向量（已 L2 归一化）
+        输出：{场域名: 引力值}，值域 [0, 1]
+              引力值 = max(0, cosine_sim)，跟 detect 的映射一致
+
+        这个值就是该球体在引力场中的坐标——
+        对恒星（场域质心）的引力决定了它属于哪个星系。
+        """
+        if not self._centroids:
+            return {}
+
+        if vector.ndim > 1:
+            vector = vector.flatten()
+
+        gravity_field = {}
+        for field, centroid in self._centroids.items():
+            # 余弦相似度（已归一化 → dot product）
+            raw = float(np.dot(vector, centroid))
+            # 映射到 [0, 1]
+            gravity_field[field] = round(max(0.0, raw), 4)
+
+        return gravity_field
+
+    def compute_gravity_fields_batch(
+        self, vectors: np.ndarray
+    ) -> List[Dict[str, float]]:
+        """批量计算多个球体的 gravity_field
+
+        Args:
+            vectors: shape (n, dim), float32, 已 L2 归一化
+
+        Returns:
+            [{场域: 引力值}, ...] 每个向量对应一个 dict
+        """
+        if not self._centroids or vectors.shape[0] == 0:
+            return [{} for _ in range(vectors.shape[0])]
+
+        # 将所有质心堆成矩阵: (n_fields, dim)
+        field_names = list(self._centroids.keys())
+        centroid_matrix = np.stack(
+            [self._centroids[f] for f in field_names], axis=0
+        )  # shape: (n_fields, dim)
+
+        # 批量点积: (n_vectors, n_fields)
+        sim_matrix = vectors @ centroid_matrix.T  # shape: (n, n_fields)
+
+        # 映射到 [0, 1] 并转为 dict
+        results = []
+        for i in range(sim_matrix.shape[0]):
+            gf = {}
+            for j, fname in enumerate(field_names):
+                val = float(sim_matrix[i, j])
+                gf[fname] = round(max(0.0, val), 4)
+            results.append(gf)
+
+        return results
+
+    def rebuild_all_gravity_fields(
+        self, sphere_store: "SphereStore", vectors_cache: Dict[str, np.ndarray]
+    ):
+        """全量重建所有球体的 gravity_field
+
+        质心变化后调用（比如新增/删场域时）。
+        会扫描所有活跃球体，重新计算到新质心的距离。
+
+        Args:
+            sphere_store: 球体库实例
+            vectors_cache: {sphere_id: vector} 向量缓存
+                           （从 faiss_store._vectors 或 embedder 获取）
+        """
+        if not self._centroids or not sphere_store:
+            return
+
+        updated = 0
+        for sphere in sphere_store.get_active():
+            vec = vectors_cache.get(sphere.id)
+            if vec is None:
+                continue
+            sphere.gravity_field = self.compute_gravity_field(vec)
+            updated += 1
+
+        logger.info(
+            f"Rebuilt gravity_field for {updated} spheres "
+            f"across {len(self._centroids)} fields"
+        )
+
+    # ── 对接聚类引擎 ─────────────────────────
+
+    def sync_from_clusters(
+        self, centroids: np.ndarray,
+        label_map: Dict[int, str],
+        counts: Optional[Dict[int, int]] = None,
+    ):
+        """从聚类引擎同步质心
+
+        把 ClusterEngine 的 k-means 质心载入 FieldDetector，
+        替换原有的标签均值质心。
+
+        Args:
+            centroids: shape (k, dim) 质心矩阵
+            label_map: {0: "簇0", 1: "簇1", ...} 簇 ID 到显示名的映射
+            counts: {0: 218, 1: 1239, ...} 每个簇的球体数量（用于统计展示）
+        """
+        self._centroids.clear()
+        self._field_counts.clear()
+
+        for i, centroid in enumerate(centroids):
+            name = label_map.get(i, f"簇{i}")
+            self._centroids[name] = centroid
+            self._field_counts[name] = counts.get(i, 0) if counts else 0
+
+        logger.info(
+            f"Synced {len(self._centroids)} centroids from cluster engine"
+        )
 
     # ── 序列化 ───────────────────────────────
 

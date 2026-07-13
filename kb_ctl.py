@@ -35,13 +35,22 @@ def is_port_in_use(port: int) -> bool:
 
 
 def is_server_healthy() -> bool:
-    """检查服务是否正常响应"""
+    """检查服务是否正常响应
+
+    用 urllib.request 而非 httpx/requests，原因：
+    httpx 默认 trust_env=True，在 Windows 上会读取系统代理设置
+    （Internet Options 中的代理），导致本地 health check 请求被
+    发到代理服务器（如 127.0.0.1:80），而非目标服务。
+    urllib.request 不继承系统代理，本地直连，不会误判。
+    """
     if not is_port_in_use(PORT):
         return False
     try:
-        import httpx
-        resp = httpx.get(f"http://127.0.0.1:{PORT}/status", timeout=3)
-        return resp.status_code == 200
+        import urllib.request
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{PORT}/status", timeout=3
+        )
+        return resp.status == 200
     except Exception:
         return False
 
@@ -104,8 +113,11 @@ def cmd_status():
     print(f"  PID 文件: {'有 (PID=' + str(pid) + ')' if pid else '无'}")
 
     if is_server_healthy():
-        import httpx
-        s = httpx.get(f"http://127.0.0.1:{PORT}/status").json()
+        import urllib.request, json
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{PORT}/status", timeout=3
+        )
+        s = json.loads(resp.read())
         print(f"  ─────────────────────")
         print(f"  服务状态: ✅ 正常运行")
         print(f"  活跃球体: {s['active_spheres']}")
@@ -168,10 +180,13 @@ def cmd_start():
         if is_server_healthy():
             print(f"  ✅ 服务已就绪 (PID={proc.pid})")
             # 打印启动日志最后几行
-            tail = open(LOG_FILE, encoding="utf-8").read().strip().split("\n")[-5:]
-            for line in tail:
-                if any(kw in line.lower() for kw in ["info", "error", "warning", "started", "loaded"]):
-                    print(f"    {line.strip()}")
+            try:
+                tail = open(LOG_FILE, encoding="utf-8", errors="replace").read().strip().split("\n")[-5:]
+                for line in tail:
+                    if any(kw in line.lower() for kw in ["info", "error", "warning", "started", "loaded"]):
+                        print(f"    {line.strip()}")
+            except Exception:
+                pass  # 日志读取失败不影响服务运行
             return
         time.sleep(1)
 

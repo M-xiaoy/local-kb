@@ -45,7 +45,13 @@ SPHERE_VERSION = 1  # 用于未来迁移
 
 @dataclass
 class Sphere:
-    """单个球体——文本切片的元数据 + 重力空间字段"""
+    """单个球体——文本切片的元数据 + 重力空间字段
+
+    gravity_field: 球体到各场域质心的引力值，由系统自动维护。
+                   格式: {"技术笔记": 0.85, "小说创作": 0.32}
+                   值域 [0, 1]，越高表示该球体越接近该场域质心。
+                   首次入库时预计算，质心变化时增量/全量更新。
+    """
     id: str                          # 唯一标识（SHA256[:12]）
     text: str                        # 原文片段
     source_file: str                 # 源文件名
@@ -54,6 +60,9 @@ class Sphere:
     diversity: float = 0.0           # 多样性得分（来源分布广度）
     effective_mass: float = 1.0      # mass × (1 + diversity)
     connections: Dict[str, float] = field(default_factory=dict)
+    gravity_field: Dict[str, float] = field(default_factory=dict)
+    term_weights: Dict[str, float] = field(default_factory=dict)  # {词: TF权重}
+    cluster_id: int = -1             # 所属簇 ID（-1=未分配，聚类后更新）
     active: bool = True              # 软删除标记
     created_at: str = ""             # 入库时间（ISO 格式）
 
@@ -272,6 +281,9 @@ class SphereStore:
             "diversity": sphere.diversity,
             "effective_mass": sphere.effective_mass,
             "connections": sphere.connections,
+            "gravity_field": sphere.gravity_field,
+            "term_weights": sphere.term_weights,
+            "cluster_id": sphere.cluster_id,
             "active": sphere.active,
             "created_at": sphere.created_at,
         }
@@ -287,6 +299,9 @@ class SphereStore:
             diversity=d.get("diversity", 0.0),
             effective_mass=d.get("effective_mass", 1.0),
             connections=d.get("connections", {}),
+            gravity_field=d.get("gravity_field", {}),
+            term_weights=d.get("term_weights", {}),
+            cluster_id=d.get("cluster_id", -1),
             active=d.get("active", True),
             created_at=d.get("created_at", ""),
         )

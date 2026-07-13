@@ -2,24 +2,23 @@
 __pycache__/
 *.pyc
 *.pyo
+.env
 *.egg-info/
-dist/
-build/
 
-# 数据目录（不上传用户数据和备份）
-data/
-data_backup_*/
+# Data (auto-generated)
+data/index/
+data/spheres/
+data/uploads/
+data/wal/
+data/clusters/
 
-# 日志和 pid
+# Logs
 *.log
 kb_server.log
-.kb_pid
 
-# 推送/调试脚本（内含敏感信息）
-_push_github.py
-_debug_*.py
-_verify_*.py
+# Test files
+_test_*
 
-# 系统
+# OS
 .DS_Store
 Thumbs.db

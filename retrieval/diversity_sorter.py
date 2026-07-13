@@ -3,7 +3,7 @@ diversity_sorter.py — 多样性排序器
 ==================================
 从 FAISS Top-100 中重排出 Top-5，兼顾相关性和多样性。
 
-算法架构（三层叠加）：
+算法架构（四层叠加）：
 
   1. MMR 基础层（行业标准）
      MMR(d) = λ · Sim(d, query) - (1-λ) · max(Sim(d, selected))
@@ -17,9 +17,9 @@ diversity_sorter.py — 多样性排序器
      利用 field_detector 的输出给匹配场域的切片加分
      实现重力空间中的场域偏好
 
-与重力空间架构的关系：
-  这是检索层的核心差异化——不是纯相似度排序，而是
-  在相似度、多样性、场域偏好之间的三方平衡。
+  4. 重力冗余度惩罚（Gravity Redundancy）
+     同一簇内与其他候选的平均相似度越高 → 信息冗余越大 → 惩罚越重
+     稀有位置（远离簇中心、邻居稀疏）的球体被优先选中
 """
 
 import logging
@@ -48,6 +48,7 @@ class DiversitySorter:
         lambda_mmr: float = 0.5,
         source_penalty: float = 0.15,
         field_bonus_weight: float = 0.1,
+        redundancy_penalty_weight: float = 0.05,
     ):
         """
         Args:
@@ -56,10 +57,13 @@ class DiversitySorter:
             source_penalty: 同源文件的额外惩罚（0~1）
                 0.15 = 轻微惩罚  0.3 = 明显惩罚
             field_bonus_weight: 场域亲和度的权重
+            redundancy_penalty_weight: 簇内冗余惩罚
+                0.05 = 轻微惩罚  0.15 = 明显惩罚
         """
         self.lambda_mmr = lambda_mmr
         self.source_penalty = source_penalty
         self.field_bonus_weight = field_bonus_weight
+        self.redundancy_penalty_weight = redundancy_penalty_weight
 
     def sort(
         self,
@@ -123,6 +127,13 @@ class DiversitySorter:
         stypes = source_types if source_types else [None] * n
         sfiles = source_files if source_files else [None] * n
 
+        # ── 预计算簇内冗余度（重力重排序）───────
+        # 对每个候选，计算它跟同一簇内其他候选的平均相似度
+        # 平均相似度高 = 信息冗余 = 被惩罚
+        redundancy_scores = self._precompute_redundancy(
+            n, sim_matrix, stypes
+        )
+
         # 已选索引和结果
         selected_indices: List[int] = []
         final_results: List[tuple] = []
@@ -131,6 +142,7 @@ class DiversitySorter:
             best_idx = self._select_next(
                 n, selected_indices, query_sims, sim_matrix,
                 sfiles, stypes, field_scores,
+                redundancy_scores=redundancy_scores,
             )
             if best_idx is None:
                 break
@@ -139,6 +151,7 @@ class DiversitySorter:
             score = self._final_score(
                 best_idx, selected_indices, query_sims, sim_matrix,
                 sfiles, stypes, field_scores,
+                redundancy_scores=redundancy_scores,
             )
 
             selected_indices.append(best_idx)
@@ -157,6 +170,7 @@ class DiversitySorter:
         source_files: List,
         source_types: List,
         field_scores: Dict[str, float],
+        redundancy_scores: Optional[np.ndarray] = None,
     ) -> Optional[int]:
         """从剩余候选中选得分最高的"""
         remaining = [i for i in range(n) if i not in selected]
@@ -177,6 +191,12 @@ class DiversitySorter:
             # 场域亲和度加分
             if field_scores:
                 score += self._field_bonus_score(idx, source_types, field_scores)
+
+            # 重力冗余度惩罚（第四层）
+            if redundancy_scores is not None and len(selected) > 0:
+                score += self._gravity_redundancy_score(
+                    idx, redundancy_scores
+                )
 
             if score > best_score:
                 best_score = score
@@ -258,6 +278,7 @@ class DiversitySorter:
         source_files: List,
         source_types: List,
         field_scores: Dict[str, float],
+        redundancy_scores: Optional[np.ndarray] = None,
     ) -> float:
         """完整得分（仅用于展示）"""
         score = self._mmr_score(idx, selected, query_sims, sim_matrix)
@@ -265,4 +286,57 @@ class DiversitySorter:
             score += self._source_penalty_score(idx, selected, source_files)
         if field_scores:
             score += self._field_bonus_score(idx, source_types, field_scores)
+        if redundancy_scores is not None and selected:
+            score += self._gravity_redundancy_score(idx, redundancy_scores)
         return score
+
+    # ── 第四层：重力冗余度 ─────────────────────
+
+    def _precompute_redundancy(
+        self,
+        n: int,
+        sim_matrix: np.ndarray,
+        source_types: List,
+    ) -> np.ndarray:
+        """预计算每个候选在簇内的平均冗余度
+
+        复用 sort() 中已算好的 sim_matrix，不重复计算。
+        对每个候选，找出同簇内所有其他候选，计算平均余弦相似度。
+        平均相似度高 = 该球体位于簇内的密集区域 = 信息冗余度高。
+
+        Returns:
+            shape (n,) float32 — 值域 [0, 1]
+            0 = 该簇中唯一的球体/与其他球体正交
+            1 = 与其他球体完全一致
+        """
+        if n <= 1:
+            return np.zeros(n, dtype=np.float32)
+
+        redundancy = np.zeros(n, dtype=np.float32)
+
+        for i in range(n):
+            same_cluster_sims = []
+            for j in range(n):
+                if (
+                    i != j
+                    and source_types[i] is not None
+                    and source_types[i] == source_types[j]
+                ):
+                    same_cluster_sims.append(sim_matrix[i, j])
+
+            if same_cluster_sims:
+                redundancy[i] = float(np.mean(same_cluster_sims))
+
+        return redundancy
+
+    def _gravity_redundancy_score(
+        self,
+        idx: int,
+        redundancy_scores: np.ndarray,
+    ) -> float:
+        """重力冗余度惩罚分
+
+        簇内平均相似度越高 → 信息越冗余 → 负分越大
+        Score = -redundancy_penalty_weight × avg_similarity
+        """
+        return -self.redundancy_penalty_weight * float(redundancy_scores[idx])

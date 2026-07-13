@@ -101,10 +101,34 @@ class WebConfig:
 
 
 # ──────────────────────────────────────────────
-# 场域配置
+# 聚类配置
 # ──────────────────────────────────────────────
-# 用户上传文件时选择标签，查询时选择目标场域
-# 空列表 = 未启用场域功能（全部统一权重）
+@dataclass
+class ClusteringConfig:
+    """k-means 聚类参数
+
+    场域不再由用户打标签定义，而是系统通过聚类自动发现。
+    上传完成后触发全量重聚类，更新每个球体的簇归属。
+    """
+    n_clusters: int = 3            # 聚簇数量（auto_detect=True 时作为参考/最小值）
+    auto_detect_k: bool = True     # 是否自动检测最优 K 值（silhouette score）
+    max_k: int = 20                # 自动检测时的最大 K 上限
+    max_iter: int = 100            # 最大迭代次数
+    random_state: int = 42         # 固定种子，保证可复现
+    n_init: int = 10               # 初始化次数（选最佳）
+    cluster_threshold: float = 0.3 # 低于此值的球体视为未分配
+    # 存储路径
+    state_file: str = "data/clusters/cluster_state.json"
+    label_map_file: str = "data/clusters/cluster_labels.json"
+
+
+# ──────────────────────────────────────────────
+# 场域配置（已迁移至聚类自动发现）
+# ──────────────────────────────────────────────
+# 此列表不再作为场域定义，仅用于：
+#   1. 历史数据兼容（旧 source_type 保留不删）
+#   2. 聚类结果的初始命名参考
+# 空列表不影响系统运行，聚类引擎会自行发现簇。
 AVAILABLE_FIELDS: List[str] = [
     "技术笔记",
     "小说创作",
@@ -122,3 +146,4 @@ ollama = OllamaConfig()
 chunker = ChunkerConfig()
 retrieval = RetrievalConfig()
 web = WebConfig()
+clustering = ClusteringConfig()

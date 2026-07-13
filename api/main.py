@@ -24,13 +24,14 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from config import paths as cfg_paths, web as cfg_web, chunker as cfg_chunker
 from pipeline.parser import parse_file, ParseResult, UnsupportedFileError
 from pipeline.chunker import chunk_text, chunk_markdown
 from pipeline.embedder import Embedder
+from pipeline.keywords import extract_keywords
 from storage.faiss_store import FaissStore
 from storage.registry import Registry
 from storage.sphere_store import SphereStore, Sphere, make_sphere_id
@@ -38,8 +39,238 @@ from storage.wal import WalManager, WAL_READY, WAL_COMMITTING
 from retrieval.field_detector import FieldDetector
 from retrieval.diversity_sorter import DiversitySorter
 from retrieval.retriever import Retriever, RetrievalResult
+from retrieval.session_manager import SessionManager
+from retrieval.cluster_engine import ClusterEngine
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────
+# 前端 HTML 页面
+# ──────────────────────────────────────────────
+
+HTML_PAGE = r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>重力知识库</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f1a; color: #e0e0e0; min-height: 100vh; }
+.container { max-width: 900px; margin: 0 auto; padding: 24px 16px; }
+
+/* 顶部 */
+.header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+.header h1 { font-size: 20px; font-weight: 600; }
+.header .subtitle { color: #888; font-size: 13px; margin-top: 2px; }
+.header-right { text-align: right; font-size: 12px; color: #666; }
+
+/* 搜索 */
+.search-area { margin-bottom: 16px; }
+.search-row { display: flex; gap: 8px; }
+.search-row input { flex: 1; padding: 10px 14px; border: 1px solid #2a2a3a; border-radius: 8px; background: #1a1a2e; color: #e0e0e0; font-size: 14px; outline: none; }
+.search-row input:focus { border-color: #4a4a8a; }
+.search-row button { padding: 10px 20px; border: none; border-radius: 8px; background: #4a4a8a; color: #fff; font-size: 14px; cursor: pointer; }
+.search-row button:hover { background: #5a5a9a; }
+.search-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 场域聚焦栏 */
+.focus-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.focus-bar .label { font-size: 12px; color: #888; margin-right: 4px; }
+.focus-btn { padding: 4px 12px; border: 1px solid #2a2a3a; border-radius: 12px; background: transparent; color: #888; font-size: 12px; cursor: pointer; }
+.focus-btn:hover { border-color: #4a4a8a; color: #aaa; }
+.focus-btn.active { background: #4a4a8a; border-color: #4a4a8a; color: #fff; }
+.focus-btn.active:hover { background: #5a5a9a; }
+.focus-btn.exit { border-color: #8a3a3a; color: #8a3a3a; }
+
+/* 结果 */
+.result-card { background: #1a1a2e; border: 1px solid #2a2a3a; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
+.result-card .meta { display: flex; gap: 8px; font-size: 11px; color: #666; margin-bottom: 6px; flex-wrap: wrap; }
+.result-card .meta .badge { padding: 1px 6px; border-radius: 4px; font-size: 10px; }
+.badge-cluster { background: #2a2a4a; color: #8a8acc; }
+.badge-field { background: #2a2a3a; color: #888; }
+.badge-score { background: #1a2a1a; color: #6a8; }
+.result-card .text { font-size: 13px; line-height: 1.6; color: #ccc; max-height: 150px; overflow-y: auto; }
+.result-card .gf { font-size: 10px; color: #555; margin-top: 6px; }
+
+/* 状态 */
+.status-bar { font-size: 12px; color: #555; margin-bottom: 16px; }
+
+/* 上传区 */
+.upload-area { margin-top: 32px; padding: 16px; border: 1px dashed #2a2a3a; border-radius: 8px; text-align: center; }
+.upload-area input { display: none; }
+.upload-area label { display: inline-block; padding: 6px 14px; border-radius: 6px; background: #2a2a3a; color: #888; font-size: 12px; cursor: pointer; }
+.upload-area label:hover { background: #3a3a4a; }
+.upload-status { font-size: 12px; color: #666; margin-top: 8px; }
+
+.loading { opacity: 0.5; }
+.empty { color: #666; font-size: 13px; text-align: center; padding: 32px; }
+</style>
+</head>
+<body>
+<div class="container" id="app">
+  <div class="header">
+    <div>
+      <h1>✦ 重力知识库</h1>
+      <div class="subtitle">FAISS + 引力场路由 + 自动聚类</div>
+    </div>
+    <div class="header-right" id="status-info">
+      <div id="sphere-count">加载中...</div>
+    </div>
+  </div>
+
+  <div class="search-area">
+    <div class="search-row">
+      <input id="query-input" type="text" placeholder="搜索知识库..." onkeydown="if(event.key==='Enter') search()">
+      <button id="search-btn" onclick="search()">搜索</button>
+    </div>
+  </div>
+
+  <div class="focus-bar" id="focus-bar">
+    <span class="label">聚焦:</span>
+    <span id="focus-buttons"></span>
+    <button class="focus-btn exit" id="exit-focus" style="display:none" onclick="resetFocus()">× 退出聚焦</button>
+  </div>
+
+  <div class="status-bar" id="session-info"></div>
+
+  <div id="results"></div>
+
+  <div class="upload-area">
+    <label for="file-upload">📄 上传文件</label>
+    <input type="file" id="file-upload" onchange="uploadFile()">
+    <div class="upload-status" id="upload-status"></div>
+  </div>
+</div>
+
+<script>
+let sessionId = localStorage.getItem("gravity_session") || null;
+let currentFocus = null;
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error((await res.json()).message || res.statusText);
+  return res.json();
+}
+
+async function loadStatus() {
+  try {
+    const s = await fetch("/status").then(r => r.json());
+    document.getElementById("sphere-count").textContent = s.active_spheres + " 球体 · " + s.fields.length + " 场域";
+    renderFocusButtons(s.fields.map((f, i) => ({ name: f, count: s.field_counts[f] || 0 })));
+  } catch(e) {
+    document.getElementById("sphere-count").textContent = "连接失败";
+  }
+}
+
+function renderFocusButtons(fields) {
+  let html = "";
+  for (const f of fields) {
+    const active = currentFocus === f.name ? "active" : "";
+    html += `<button class="focus-btn ${active}" onclick="setFocus('${f.name}')">${f.name}</button> `;
+  }
+  document.getElementById("focus-buttons").innerHTML = html;
+  document.getElementById("exit-focus").style.display = currentFocus ? "inline-block" : "none";
+}
+
+async function search() {
+  const q = document.getElementById("query-input").value.trim();
+  if (!q) return;
+  
+  document.getElementById("search-btn").disabled = true;
+  document.getElementById("results").innerHTML = "<div class='loading'>搜索中...</div>";
+  
+  try {
+    const payload = { query: q, top_k: 5 };
+    if (sessionId) payload.session_id = sessionId;
+    if (currentFocus) payload.field_focus = currentFocus;
+    
+    const data = await api("/query", payload);
+    sessionId = data.session_id;
+    if (sessionId) localStorage.setItem("gravity_session", sessionId);
+    
+    renderResults(data);
+    document.getElementById("session-info").textContent = "会话: " + sessionId.slice(0, 8) + "...";
+  } catch(e) {
+    document.getElementById("results").innerHTML = "<div class='empty'>错误: " + e.message + "</div>";
+  }
+  document.getElementById("search-btn").disabled = false;
+}
+
+function renderResults(data) {
+  const r = data.results;
+  if (!r || r.length === 0) {
+    document.getElementById("results").innerHTML = "<div class='empty'>无结果</div>";
+    return;
+  }
+  let html = "";
+  for (const item of r) {
+    const text = item.text;
+    const gf = item.gravity_field ? Object.entries(item.gravity_field).map(([k,v]) => `${k}:${v.toFixed(2)}`).join(" ") : "";
+    html += `<div class="result-card">`;
+    html += `<div class="meta">`;
+    html += `<span class="badge badge-cluster">簇${item.cluster_id}</span>`;
+    html += `<span class="badge badge-field">${item.source_type || "?"}</span>`;
+    html += `<span class="badge badge-score">${item.score.toFixed(3)}</span>`;
+    html += `</div>`;
+    html += `<div class="text">${escapeHtml(text)}</div>`;
+    if (gf) html += `<div class="gf">${gf}</div>`;
+    html += `</div>`;
+  }
+  document.getElementById("results").innerHTML = html;
+}
+
+function escapeHtml(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+function setFocus(field) {
+  currentFocus = field;
+  renderFocusButtons([]);
+  loadStatus();
+  if (document.getElementById("query-input").value.trim()) search();
+}
+
+function resetFocus() {
+  currentFocus = null;
+  renderFocusButtons([]);
+  loadStatus();
+  if (sessionId) {
+    api("/query", { query: ".", top_k: 1, session_id: sessionId, reset_focus: true }).then(() => {});
+  }
+}
+
+async function uploadFile() {
+  const fileInput = document.getElementById("file-upload");
+  const file = fileInput.files[0];
+  if (!file) return;
+  
+  const status = document.getElementById("upload-status");
+  status.textContent = "上传中...";
+  
+  const form = new FormData();
+  form.append("file", file);
+  form.append("source_type", "");
+  
+  try {
+    const res = await fetch("/upload", { method: "POST", body: form });
+    const data = await res.json();
+    status.textContent = "已上传: " + data.new_spheres + " 新球体 (" + data.timing_ms.total.toFixed(0) + "ms)";
+    loadStatus();
+  } catch(e) {
+    status.textContent = "上传失败: " + e.message;
+  }
+  fileInput.value = "";
+}
+
+loadStatus();
+</script>
+</body>
+</html>'''
+
 
 # ──────────────────────────────────────────────
 # FastAPI 应用
@@ -181,6 +412,8 @@ class AppState:
         self.uploads_dir = Path(cfg_paths.uploads_dir)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.wal = WalManager(str(Path(cfg_paths.wal_dir)))
+        self.sessions = SessionManager()
+        self.cluster_engine = ClusterEngine()
 
     def is_loaded(self) -> bool:
         return self.faiss_store.is_built
@@ -197,6 +430,10 @@ class QueryRequest(BaseModel):
     query: str
     top_k: int = 5
     fetch_k: int = 100
+    session_id: Optional[str] = None   # 会话追踪
+    field_focus: Optional[str] = None    # 聚焦某场域（null=不聚焦）
+    reset_focus: bool = False            # 退出聚焦
+    exclude_ids: Optional[List[str]] = None  # 排除已返回的球体
 
 
 class QueryResponse(BaseModel):
@@ -205,6 +442,8 @@ class QueryResponse(BaseModel):
     field_affinities: dict
     total_spheres: int
     timing_ms: dict
+    session_id: Optional[str] = None   # 会话 ID
+    focus_field: Optional[str] = None  # 当前聚焦的场域
 
 
 class UploadResponse(BaseModel):
@@ -257,11 +496,113 @@ async def startup():
         faiss_count = state.faiss_store.load()
         logger.info(f"FAISS index loaded: {faiss_count} vectors")
 
-        # 从球体库重建场域质心
-        if sphere_count > 0:
+        # 加载聚类状态（如果有）
+        cluster_loaded = state.cluster_engine.load()
+        if cluster_loaded:
+            # 从聚类状态恢复每个球体的 cluster_id
+            k = state.cluster_engine.n_centroids
+            centroids = state.cluster_engine.centroids
+
+            if faiss_count > 0 and centroids is not None:
+                try:
+                    # 用聚类质心预测每个球体的归属
+                    active = state.sphere_store.get_active()
+                    vectors_for_cluster = []
+                    valid_spheres = []
+                    for s in active:
+                        fid = state.registry.faiss_id(s.id)
+                        if fid is not None and fid in state.faiss_store._vectors:
+                            vectors_for_cluster.append(state.faiss_store._vectors[fid])
+                            valid_spheres.append(s)
+
+                    if len(vectors_for_cluster) >= 2:
+                        labels, _ = state.cluster_engine.predict(
+                            np.stack(vectors_for_cluster, axis=0)
+                        )
+                        for s, label in zip(valid_spheres, labels):
+                            s.cluster_id = int(label)
+
+                        # 统计簇大小
+                        cluster_counts = {}
+                        for s in active:
+                            if s.cluster_id >= 0:
+                                cluster_counts[s.cluster_id] = cluster_counts.get(s.cluster_id, 0) + 1
+
+                        # 同步到 field_detector 并重算 gravity_field
+                        label_map = {i: f"簇{i}" for i in range(k)}
+                        state.field_detector.sync_from_clusters(
+                            centroids, label_map, cluster_counts
+                        )
+                        state.field_detector.rebuild_all_gravity_fields(
+                            state.sphere_store,
+                            {s.id: state.faiss_store._vectors.get(
+                                state.registry.faiss_id(s.id)
+                            ) for s in active if state.registry.faiss_id(s.id) is not None}
+                        )
+                        logger.info(f"Restored cluster assignments: {len(valid_spheres)} spheres → {k} clusters")
+                except Exception as e:
+                    logger.warning(f"Failed to restore cluster assignments: {e}")
+            else:
+                label_map = {i: f"簇{i}" for i in range(k)}
+                state.field_detector.sync_from_clusters(centroids, label_map)
+                logger.info(f"Cluster centroids synced to FieldDetector (no spheres for assignment): {k} clusters")
+
+        # 从球体库重建场域质心（仅在无聚类状态时回退）
+        if not cluster_loaded and sphere_count > 0:
             field_vectors = _collect_field_vectors(state.sphere_store, state.faiss_store, state.registry)
             state.field_detector.rebuild_centroids(field_vectors)
-            logger.info(f"Field centroids rebuilt: {state.field_detector.field_count} fields")
+            logger.info(f"Field centroids rebuilt from labels: {state.field_detector.field_count} fields")
+
+            # gravity_field 迁移：为旧数据补算到各质心的引力值
+            migrated = _migrate_gravity_fields(
+                state.sphere_store, state.faiss_store,
+                state.registry, state.field_detector
+            )
+            logger.info(f"gravity_field migration: {migrated} spheres updated")
+
+            # 如果有球体但没有保存的聚类状态 → 首次聚类
+            if not cluster_loaded and faiss_count >= 2:
+                try:
+                    vectors = []
+                    for s in state.sphere_store.get_active():
+                        fid = state.registry.faiss_id(s.id)
+                        if fid is not None and fid in state.faiss_store._vectors:
+                            vectors.append(state.faiss_store._vectors[fid])
+
+                    if len(vectors) >= 2:
+                        vectors_arr = np.stack(vectors, axis=0)
+                        centroids, labels, _ = state.cluster_engine.fit_predict(vectors_arr)
+
+                        k = centroids.shape[0]
+                        label_map = {i: f"簇{i}" for i in range(k)}
+
+                        for sphere, label in zip(state.sphere_store.get_active(), labels):
+                            sphere.cluster_id = int(label)
+
+                        # 统计每个簇的球体数（用于 status 展示）
+                        cluster_counts = {}
+                        for s in state.sphere_store.get_active():
+                            cid = s.cluster_id
+                            if cid >= 0:
+                                cluster_counts[cid] = cluster_counts.get(cid, 0) + 1
+
+                        state.field_detector.sync_from_clusters(
+                            centroids, label_map, cluster_counts
+                        )
+
+                        # 全量重算 gravity_field
+                        state.field_detector.rebuild_all_gravity_fields(
+                            state.sphere_store,
+                            {s.id: state.faiss_store._vectors.get(
+                                state.registry.faiss_id(s.id)
+                            ) for s in state.sphere_store.get_active()
+                             if state.registry.faiss_id(s.id) is not None}
+                        )
+
+                        state.cluster_engine.save()
+                        logger.info(f"Initial clustering on startup: {len(vectors)} spheres → {k} clusters")
+                except Exception as e:
+                    logger.warning(f"Initial clustering failed: {e}")
 
         if faiss_count > 0 and sphere_count > 0:
             logger.info("Knowledge base loaded successfully")
@@ -269,6 +610,16 @@ async def startup():
             logger.info("Empty knowledge base — ready for uploads")
     except Exception as e:
         logger.warning(f"Startup load failed (first run?): {e}")
+
+
+# ──────────────────────────────────────────────
+# 端点：首页（前端界面）
+# ──────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    """前端首页"""
+    return HTMLResponse(content=HTML_PAGE)
 
 
 # ──────────────────────────────────────────────
@@ -389,16 +740,28 @@ async def upload_file(
             chunk_vectors[i] = new_vectors[new_idx]
             new_idx += 1
 
-    # ── 5. 创建新球体 ──────────────────────────
+    # ── 5. 创建新球体（含 gravity_field 预计算）──
     t4 = time.time()
     new_spheres = 0
     added_vectors: list = []
     added_ids: list = []
     added_sphere_ids: list = []
+    new_gravity_fields: list = []  # 收集新球体的 gravity_field，给后续步骤用
 
     for i, (sphere_id, chunk_txt, vec) in enumerate(zip(chunk_sphere_ids, chunks, chunk_vectors)):
         if not new_mask[i]:
+            # 旧球体：检查 gravity_field 是否需要补算
+            existing = state.sphere_store.get(sphere_id)
+            if existing and not existing.gravity_field:
+                existing.gravity_field = state.field_detector.compute_gravity_field(vec)
             continue
+
+        # 新球体：预计算 gravity_field（到各场域质心的引力值）
+        gravity_field = state.field_detector.compute_gravity_field(vec)
+
+        # 提取关键词权重（用于术语引力混合检索）
+        term_weights = extract_keywords(chunk_txt)
+
         sphere = Sphere(
             id=sphere_id,
             text=chunk_txt,
@@ -407,6 +770,8 @@ async def upload_file(
                 "技术笔记" if result.metadata.get("headings") else "其他"
             ),
             mass=1.0,
+            gravity_field=gravity_field,
+            term_weights=term_weights,
             created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         if state.sphere_store.add(sphere):
@@ -415,6 +780,7 @@ async def upload_file(
         added_vectors.append(vec)
         added_ids.append(faiss_id)
         added_sphere_ids.append(sphere_id)
+        new_gravity_fields.append(gravity_field)
     timings["create_spheres"] = time.time() - t4
 
     # ── 5.5 WAL：记录本次操作 ─────────────────
@@ -472,6 +838,53 @@ async def upload_file(
             state.wal.mark_done(wal_entry)
     timings["persist"] = time.time() - t7
 
+    # ── 9. 上传后聚类 ────────────────────────
+    t8 = time.time()
+    if new_spheres > 0 and auto_rebuild:
+        active_spheres = state.sphere_store.get_active()
+        if len(active_spheres) >= 2:  # 至少 2 个才能聚类
+            try:
+                vectors = []
+                for s in active_spheres:
+                    fid = state.registry.faiss_id(s.id)
+                    if fid is not None and fid in state.faiss_store._vectors:
+                        vectors.append(state.faiss_store._vectors[fid])
+
+                if len(vectors) >= 2:
+                    vectors_arr = np.stack(vectors, axis=0)
+                    centroids, labels, scores = state.cluster_engine.fit_predict(vectors_arr)
+
+                    # 更新每个球体的 cluster_id + gravity_field
+                    k = centroids.shape[0]
+                    label_map = {i: f"簇{i}" for i in range(k)}
+
+                    for sphere, label, score in zip(active_spheres, labels, scores):
+                        sphere.cluster_id = int(label)
+
+                    # 批量重算 gravity_field
+                    # 统计每个簇的球体数
+                    cluster_counts = {}
+                    for s in active_spheres:
+                        if s.cluster_id >= 0:
+                            cluster_counts[s.cluster_id] = cluster_counts.get(s.cluster_id, 0) + 1
+
+                    state.field_detector.sync_from_clusters(
+                        centroids, label_map, cluster_counts
+                    )
+                    state.field_detector.rebuild_all_gravity_fields(
+                        state.sphere_store,
+                        {s.id: state.faiss_store._vectors.get(
+                            state.registry.faiss_id(s.id)
+                        ) for s in active_spheres if state.registry.faiss_id(s.id) is not None}
+                    )
+
+                    # 持久化聚类状态
+                    state.cluster_engine.save()
+                    logger.info(f"Post-upload clustering: {len(active_spheres)} spheres → {k} clusters")
+            except Exception as e:
+                logger.warning(f"Post-upload clustering failed (non-critical): {e}")
+    timings["clustering"] = time.time() - t8
+
     timings["total"] = time.time() - t0
 
     return UploadResponse(
@@ -502,11 +915,42 @@ async def query(request: QueryRequest):
     if not state.is_loaded():
         raise HTTPException(status_code=400, detail="Knowledge base is empty. Upload files first.")
 
+    # 会话管理：自动创建（客户端不传时也生成 session_id）
+    session = state.sessions.get_or_create(request.session_id)
+
+    # 处理聚焦状态
+    if request.reset_focus:
+        if session:
+            session.reset_focus()
+        effective_focus = None
+    elif request.field_focus is not None:
+        # 用户明确指定聚焦
+        if session:
+            session.set_focus(request.field_focus)
+        effective_focus = request.field_focus
+    elif session and session.field_focus:
+        # 沿用会话中的聚焦状态
+        effective_focus = session.field_focus
+    else:
+        effective_focus = None
+
+    # 排除已返回的球体
+    exclude = set(request.exclude_ids or [])
+    if session:
+        exclude |= session.exclude_ids
+
     result: RetrievalResult = state.retriever.retrieve(
         query=request.query,
         top_k=request.top_k,
         fetch_k=request.fetch_k,
+        field_focus=effective_focus,
+        exclude_ids=list(exclude),
     )
+
+    # 记录返回的球体 ID 到会话
+    returned_ids = [s.id for s in result.spheres]
+    if session:
+        session.add_excluded(returned_ids)
 
     return QueryResponse(
         query=result.query,
@@ -517,12 +961,16 @@ async def query(request: QueryRequest):
                 "source_type": s.source_type,
                 "score": float(round(result.scores[i], 4)),
                 "sphere_id": s.id,
+                "gravity_field": s.gravity_field if s.gravity_field else None,
+                "cluster_id": s.cluster_id,
             }
             for i, s in enumerate(result.spheres)
         ],
         field_affinities={k: float(v) for k, v in result.field_affinities.items()},
         total_spheres=result.total_count,
         timing_ms={k: round(v * 1000, 1) for k, v in result.timing.items()},
+        session_id=session.session_id if session else None,
+        focus_field=effective_focus if effective_focus else None,
     )
 
 
@@ -635,3 +1083,41 @@ def _collect_field_vectors(
                 faiss_store._vectors[fid]
             )
     return field_vectors
+
+
+def _migrate_gravity_fields(
+    sphere_store: SphereStore,
+    faiss_store: FaissStore,
+    registry: Registry,
+    field_detector: FieldDetector,
+) -> int:
+    """为旧数据补算 gravity_field
+
+    启动时执行，检查所有活跃球体：
+      - 没有 gravity_field 的 → 从 FAISS 缓存读向量 → 计算
+      - 有但场域列表不完整的 → 补全
+
+    Returns:
+        更新的球体数量
+    """
+    if not hasattr(faiss_store, '_vectors') or not faiss_store._vectors:
+        return 0
+
+    updated = 0
+    known_fields = set(field_detector.fields)
+
+    for sphere in sphere_store.get_active():
+        fid = registry.faiss_id(sphere.id)
+        if fid is None or fid not in faiss_store._vectors:
+            continue
+        vec = faiss_store._vectors[fid]
+
+        current_fields = set(sphere.gravity_field.keys())
+
+        if not sphere.gravity_field or current_fields != known_fields:
+            sphere.gravity_field = field_detector.compute_gravity_field(vec)
+            updated += 1
+
+    if updated > 0:
+        logger.info(f"Migrated gravity_field for {updated} spheres")
+    return updated
