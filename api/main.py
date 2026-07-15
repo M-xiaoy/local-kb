@@ -33,15 +33,24 @@ from pipeline.parser import parse_file, ParseResult, UnsupportedFileError
 from pipeline.chunker import chunk_text, chunk_markdown
 from pipeline.embedder import Embedder
 from pipeline.keywords import extract_keywords
+from pipeline.rewriter import TextRewriter
+from pipeline.connections import ConnectionDetector
 from storage.faiss_store import FaissStore
 from storage.registry import Registry
 from storage.sphere_store import SphereStore, Sphere, make_sphere_id
+from storage.calibrator import SphereCalibrator
 from storage.wal import WalManager, WAL_READY, WAL_COMMITTING
 from retrieval.field_detector import FieldDetector
 from retrieval.diversity_sorter import DiversitySorter
 from retrieval.retriever import Retriever, RetrievalResult
+from retrieval.reranker import LocalReranker
+from retrieval.activation import ActivationPropagator
 from retrieval.session_manager import SessionManager
 from retrieval.cluster_engine import ClusterEngine
+from retrieval.tools.navigate import navigate_sphere
+from retrieval.tools.explore import explore_cluster
+from retrieval.tools.trace import trace_conversation
+from retrieval.tools.bridge import find_bridge
 from pipeline.generator import AnswerGenerator, get_generator
 
 logger = logging.getLogger(__name__)
@@ -58,31 +67,115 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>重力知识库</title>
 <style>
+  /* ── Reset & Base ── */
   *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
     background: #f8f9fb; color: #1e293b; min-height: 100vh;
+    display: flex; flex-direction: column;
   }
-  .container { max-width: 720px; margin: 0 auto; padding: 0 20px; }
+  body.chat-mode { background: #fff; height: 100vh; overflow: hidden; }
 
-  /* Header */
+  /* ── Layout ── */
   .header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 16px 0; border-bottom: 1px solid #e9eef2;
+    padding: 14px 20px; border-bottom: 1px solid #e9eef2;
+    background: #fff; flex-shrink: 0; z-index: 10;
+    position: relative;
   }
   .header-left { display: flex; align-items: center; gap: 10px; }
-  .header-logo { font-size: 18px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; }
+  .header-logo { font-size: 17px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; }
   .header-logo span { color: #6366f1; }
-  .header-sub { font-size: 12px; color: #94a3b8; margin-top: 1px; }
-  .header-right { font-size: 12px; color: #94a3b8; text-align: right; }
+  .header-sub { font-size: 11px; color: #94a3b8; }
+  .header-right { font-size: 12px; color: #94a3b8; display: flex; align-items: center; gap: 12px; }
 
-  /* Hero search */
-  .hero { padding: 60px 0 32px; text-align: center; }
+  /* ── Hero (initial state) ── */
+  .hero {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 40px 20px 60px; transition: all 0.4s ease;
+  }
+  .chat-mode .hero { display: none; }
+  .hero-icon { font-size: 40px; margin-bottom: 12px; }
   .hero h2 { font-size: 24px; font-weight: 600; color: #0f172a; margin-bottom: 6px; }
   .hero p { font-size: 14px; color: #64748b; margin-bottom: 28px; }
+  .hero .search-box { max-width: 560px; width: 100%; }
+
+  /* ── Chat messages ── */
+  .chat-area {
+    flex: 1; overflow-y: auto; padding: 4px 0 0;
+    display: none; flex-direction: column; min-height: 0;
+  }
+  .chat-mode .chat-area { display: flex; }
+  .chat-inner { max-width: 720px; margin: 0 auto; padding: 0 20px 16px; width: 100%; }
+
+  /* ── Message Cards ── */
+  .msg-group { margin-bottom: 16px; }
+  .msg-user {
+    background: #f1f5f9; border-radius: 12px 12px 4px 12px;
+    padding: 10px 16px; margin-bottom: 8px;
+    font-size: 14px; line-height: 1.6; color: #1e293b;
+    max-width: 80%; margin-left: auto;
+  }
+  .msg-user .label { font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+  .msg-assistant {
+    background: #fff; border: 1px solid #e9eef2; border-radius: 12px;
+    padding: 16px 18px; position: relative;
+  }
+
+  /* ── Answer text ── */
+  .answer-text {
+    font-size: 14px; line-height: 1.7; color: #1e293b;
+    white-space: pre-wrap; margin-bottom: 12px;
+  }
+  .answer-text:empty { display: none; }
+  .answer-error { color: #ef4444; font-size: 13px; }
+  .answer-meta {
+    font-size: 11px; color: #94a3b8;
+    display: flex; gap: 12px; align-items: center; margin-bottom: 8px;
+  }
+  .answer-meta .label { color: #94a3b8; }
+
+  /* ── Reference toggles ── */
+  .ref-header {
+    border-top: 1px solid #f1f5f9; padding-top: 10px; margin-top: 2px;
+    display: flex; align-items: center; justify-content: space-between;
+    cursor: pointer; user-select: none;
+  }
+  .ref-header:hover { color: #6366f1; }
+  .ref-header span { font-size: 12px; color: #94a3b8; font-weight: 500; }
+  .ref-header .arrow { font-size: 10px; transition: transform 0.2s; }
+  .ref-header .arrow.open { transform: rotate(180deg); }
+  .ref-body { display: none; margin-top: 10px; }
+  .ref-body.open { display: block; }
+
+  /* ── Result cards (in references) ── */
+  .result-card {
+    background: #fafbfc; border: 1px solid #e9eef2; border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 6px;
+  }
+  .result-meta {
+    display: flex; gap: 6px; font-size: 11px; color: #94a3b8;
+    margin-bottom: 5px; flex-wrap: wrap; align-items: center;
+  }
+  .badge { padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 500; white-space: nowrap; }
+  .badge-cluster { background: #eef2ff; color: #6366f1; }
+  .badge-field { background: #f1f5f9; color: #64748b; }
+  .badge-score { background: #ecfdf5; color: #059669; }
+  .result-text {
+    font-size: 13px; line-height: 1.6; color: #475569;
+    max-height: 60px; overflow: hidden; transition: max-height 0.25s;
+  }
+  .result-text.expanded { max-height: none; }
+  .result-expand {
+    font-size: 11px; color: #a5b4fc; cursor: pointer;
+    margin-top: 4px; display: inline-block;
+  }
+  .result-expand:hover { color: #6366f1; }
+
+  /* ── Search Box (shared) ── */
   .search-box {
-    display: flex; align-items: center;
-    max-width: 560px; margin: 0 auto;
+    display: flex; align-items: center; width: 100%;
     background: #fff; border: 1px solid #e2e8f0;
     border-radius: 12px; padding: 4px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.02);
@@ -94,162 +187,184 @@ HTML_PAGE = r'''<!DOCTYPE html>
   }
   .search-box input {
     flex: 1; border: none; outline: none;
-    padding: 12px 16px; font-size: 15px; color: #1e293b;
+    padding: 10px 14px; font-size: 14px; color: #1e293b;
     background: transparent;
   }
   .search-box input::placeholder { color: #94a3b8; }
-  .search-box .actions { display: flex; gap: 6px; padding-right: 4px; }
+  .search-box .actions { display: flex; gap: 4px; align-items: center; padding-right: 4px; }
   .search-box select {
     border: none; outline: none; background: #f1f5f9;
-    padding: 6px 10px; border-radius: 8px;
-    font-size: 12px; color: #475569; cursor: pointer;
+    padding: 5px 8px; border-radius: 8px;
+    font-size: 11px; color: #475569; cursor: pointer;
   }
   .search-box select:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn {
-    padding: 8px 16px; border: none; border-radius: 8px;
-    font-size: 13px; font-weight: 500; cursor: pointer;
-    transition: background 0.15s, opacity 0.15s;
+    padding: 7px 14px; border: none; border-radius: 8px;
+    font-size: 12px; font-weight: 500; cursor: pointer;
+    transition: background 0.12s, opacity 0.12s;
   }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn-primary { background: #6366f1; color: #fff; }
   .btn-primary:hover:not(:disabled) { background: #4f46e5; }
-  .btn-success { background: #10b981; color: #fff; }
-  .btn-success:hover:not(:disabled) { background: #059669; }
+  .btn-icon {
+    padding: 6px 8px; border: none; border-radius: 8px;
+    font-size: 16px; cursor: pointer; background: transparent;
+    transition: background 0.12s; line-height: 1;
+  }
+  .btn-icon:hover { background: #f1f5f9; }
 
-  /* Toolbar */
-  .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; padding: 0 4px; }
-  .toolbar-label { font-size: 12px; color: #94a3b8; margin-right: 4px; }
+  /* ── Bottom input bar (chat mode) ── */
+  .input-bar {
+    flex-shrink: 0; padding: 10px 20px 16px; border-top: 1px solid #e9eef2;
+    background: #fff; display: none; flex-shrink: 0;
+  }
+  .chat-mode .input-bar { display: block; }
+  .input-bar .search-box { max-width: 720px; margin: 0 auto; }
+  .focus-row {
+    max-width: 720px; margin: 6px auto 0; padding: 0 8px;
+    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+  }
+  .focus-label { font-size: 11px; color: #94a3b8; }
   .pill {
-    padding: 4px 14px; border: 1px solid #e2e8f0; border-radius: 20px;
-    background: #fff; color: #64748b; font-size: 12px; cursor: pointer;
-    transition: all 0.15s;
+    padding: 3px 12px; border: 1px solid #e2e8f0; border-radius: 20px;
+    background: #fff; color: #64748b; font-size: 11px; cursor: pointer;
+    transition: all 0.12s;
   }
   .pill:hover { border-color: #c7d2fe; color: #6366f1; }
   .pill.active { background: #6366f1; border-color: #6366f1; color: #fff; }
-  .pill.exit { border-color: #fecaca; color: #ef4444; }
-  .pill.exit:hover { background: #fef2f2; }
 
-  /* Answer card */
-  .answer-card {
-    background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%);
-    border: 1px solid #a7f3d0; border-radius: 12px;
-    padding: 16px 20px; margin-bottom: 16px;
-  }
-  .answer-meta { font-size: 11px; color: #6ee7b7; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; }
-  .answer-meta .label { color: #94a3b8; }
-  .answer-text { font-size: 14px; line-height: 1.7; color: #065f46; white-space: pre-wrap; }
-  .answer-error { color: #ef4444; font-size: 13px; }
-
-  /* Result card */
-  .result-card {
+  /* ── Upload (collapsible panel in header) ── */
+  .upload-panel {
+    position: absolute; top: 100%; right: 20px; z-index: 20;
     background: #fff; border: 1px solid #e9eef2; border-radius: 10px;
-    padding: 14px 18px; margin-bottom: 8px;
-    transition: border-color 0.15s;
+    padding: 14px 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+    width: 280px; display: none;
   }
-  .result-card:hover { border-color: #cbd5e1; }
-  .result-meta {
-    display: flex; gap: 8px; font-size: 11px; color: #94a3b8;
-    margin-bottom: 6px; flex-wrap: wrap; align-items: center;
+  .upload-panel.open { display: block; }
+  .upload-panel h4 { font-size: 12px; color: #475569; margin-bottom: 8px; }
+  .upload-drop {
+    border: 1.5px dashed #d1d5db; border-radius: 8px;
+    padding: 16px; text-align: center; cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    font-size: 12px; color: #94a3b8;
   }
-  .badge { padding: 1px 8px; border-radius: 4px; font-size: 10px; font-weight: 500; }
-  .badge-cluster { background: #eef2ff; color: #6366f1; }
-  .badge-field { background: #f1f5f9; color: #64748b; }
-  .badge-score { background: #ecfdf5; color: #059669; }
-  .result-text {
-    font-size: 13px; line-height: 1.6; color: #475569;
-    max-height: 120px; overflow-y: auto;
-  }
-  .result-gf { font-size: 10px; color: #cbd5e1; margin-top: 6px; }
-
-  /* Status bar */
-  .status-bar { font-size: 11px; color: #cbd5e1; margin-bottom: 16px; padding: 0 4px; }
-
-  /* Upload */
-  .upload-area {
-    margin: 40px 0 32px; padding: 20px;
-    border: 1px dashed #d1d5db; border-radius: 10px;
-    text-align: center; background: #fafbfc;
-  }
-  .upload-area label {
-    display: inline-block; padding: 6px 18px;
-    border-radius: 20px; background: #fff; color: #64748b;
-    border: 1px solid #e2e8f0; font-size: 12px; cursor: pointer;
-    transition: all 0.15s;
-  }
-  .upload-area label:hover { border-color: #6366f1; color: #6366f1; }
-  .upload-area input { display: none; }
+  .upload-drop:hover { border-color: #a5b4fc; background: #f8f9ff; }
+  .upload-drop.dragover { border-color: #6366f1; background: #eef2ff; }
+  .upload-drop input { display: none; }
   .upload-status { font-size: 11px; color: #94a3b8; margin-top: 8px; }
+  .upload-btn-header {
+    padding: 4px 12px; border: 1px solid #e2e8f0; border-radius: 12px;
+    background: #fff; color: #64748b; font-size: 11px; cursor: pointer;
+    transition: all 0.12s;
+  }
+  .upload-btn-header:hover { border-color: #a5b4fc; color: #6366f1; }
 
-  /* Empty state */
-  .empty-state { text-align: center; padding: 48px 0; color: #94a3b8; }
-  .empty-state .icon { font-size: 32px; margin-bottom: 8px; }
-  .empty-state p { font-size: 13px; }
+  /* ── Loading skeleton ── */
+  @keyframes shimmer { 0% { background-position: -200px 0; } 100% { background-position: calc(200px + 100%) 0; } }
+  .skeleton {
+    background: linear-gradient(90deg, #f1f5f9 25%, #e9eef2 50%, #f1f5f9 75%);
+    background-size: 200px 100%; animation: shimmer 1.5s infinite;
+    border-radius: 8px; margin-bottom: 8px;
+  }
+  .skeleton-line { height: 14px; width: 100%; margin-bottom: 6px; }
+  .skeleton-line.short { width: 60%; }
+  .skeleton-card { height: 80px; border-radius: 8px; margin-bottom: 6px; }
 
-  /* Loading */
-  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .loading { animation: pulse 1.5s ease-in-out infinite; color: #94a3b8; text-align: center; padding: 32px; font-size: 13px; }
+  /* ── Field affinity ── */
+  .affinity-bar { font-size: 10px; color: #cbd5e1; margin: 4px 0 8px; }
 
-  /* Section title */
-  .section-title { font-size: 12px; font-weight: 600; color: #94a3b8; margin: 20px 0 10px; padding: 0 4px; }
+  /* ── Empty state ── */
+  .empty-chat { text-align: center; padding: 60px 0; color: #94a3b8; }
+  .empty-chat .icon { font-size: 28px; margin-bottom: 6px; }
+  .empty-chat p { font-size: 13px; }
+
+  /* ── Responsive ── */
+  @media (max-width: 600px) {
+    .header { padding: 10px 14px; }
+    .header-sub { display: none; }
+    .chat-inner { padding: 0 12px; }
+    .msg-user { max-width: 90%; font-size: 13px; }
+    .msg-assistant { padding: 12px 14px; }
+    .input-bar { padding: 8px 12px 12px; }
+    .hero h2 { font-size: 20px; }
+    .upload-panel { right: 10px; width: 240px; }
+    .search-box select { font-size: 10px; padding: 4px 6px; }
+    .search-box input { padding: 8px 10px; font-size: 13px; }
+  }
 </style>
 </head>
 <body>
-<div class="container">
-  <!-- Header -->
-  <div class="header">
-    <div class="header-left">
-      <div class="header-logo"><span>✦</span> 重力知识库</div>
-      <div class="header-sub">FAISS + 重力场路由 + 自动聚类</div>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <div class="header-logo"><span>✦</span> 重力知识库</div>
+    <div class="header-sub">FAISS + 重力场路由 + 自动聚类</div>
+  </div>
+  <div class="header-right">
+    <span id="sphere-count">加载中...</span>
+    <button class="upload-btn-header" id="upload-toggle" onclick="toggleUploadPanel()">\U0001f4ce 上传</button>
+  </div>
+
+  <!-- Upload panel (collapsible) -->
+  <div class="upload-panel" id="upload-panel">
+    <h4>上传文件到知识库</h4>
+    <div class="upload-drop" id="upload-drop"
+         onclick="document.getElementById('file-input').click()"
+         ondragover="event.preventDefault(); this.classList.add('dragover')"
+         ondragleave="this.classList.remove('dragover')"
+         ondrop="event.preventDefault(); this.classList.remove('dragover'); handleDrop(event)">
+      <div>\U0001f4c2 拖拽文件到此处</div>
+      <div style="margin-top:6px;font-size:11px;color:#cbd5e1">PDF · DOCX · MD · TXT</div>
+      <input type="file" id="file-input" accept=".pdf,.docx,.md,.txt" onchange="handleFileSelect(event)">
     </div>
-    <div class="header-right" id="sphere-count">加载中...</div>
-  </div>
-
-  <!-- Hero -->
-  <div class="hero">
-    <h2>搜索你的知识库</h2>
-    <p>自动聚类 · 引力场路由 · 多模型问答</p>
-    <div class="search-box">
-      <input id="query-input" type="text" placeholder="Enter 搜索 · Shift+Enter 问答" autofocus>
-      <div class="actions">
-        <select id="model-select">
-          <option value="ollama">Ollama</option>
-          <option value="deepseek">DeepSeek</option>
-        </select>
-        <button class="btn btn-primary" id="search-btn" onclick="search()">搜索</button>
-        <button class="btn btn-success" id="ask-btn" onclick="ask()">问答</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Toolbar -->
-  <div class="toolbar" id="toolbar">
-    <span class="toolbar-label">聚焦</span>
-    <span id="focus-pills"></span>
-    <button class="pill exit" id="exit-focus" style="display:none" onclick="resetFocus()">x 清除</button>
-  </div>
-
-  <!-- Status -->
-  <div class="status-bar" id="session-info"></div>
-
-  <!-- Answer -->
-  <div class="answer-card" id="answer-area" style="display:none">
-    <div class="answer-meta">
-      <span id="answer-model"></span>
-      <span id="answer-timing"></span>
-      <span class="answer-error" id="answer-error" style="display:none"></span>
-    </div>
-    <div class="answer-text" id="answer-text"></div>
-  </div>
-
-  <!-- Results -->
-  <div class="section-title" id="results-title" style="display:none">检索结果</div>
-  <div id="results"></div>
-
-  <!-- Upload -->
-  <div class="upload-area">
-    <label for="file-upload">+ 上传文件（PDF / DOCX / MD / TXT）</label>
-    <input type="file" id="file-upload" onchange="uploadFile()">
     <div class="upload-status" id="upload-status"></div>
+  </div>
+</div>
+
+<!-- Hero (initial) -->
+<div class="hero" id="hero">
+  <div class="hero-icon">✦</div>
+  <h2>搜索你的知识库</h2>
+  <p>自动聚类 · 引力场路由 · 多模型问答</p>
+  <div class="search-box">
+    <input id="query-input-hero" type="text" placeholder="输入问题，Enter 发送" autofocus>
+    <div class="actions">
+      <select id="model-select-hero">
+        <option value="ollama">Ollama</option>
+        <option value="deepseek">DeepSeek</option>
+      </select>
+      <button class="btn btn-primary" onclick="doQuery('hero')">发送</button>
+    </div>
+  </div>
+</div>
+
+<!-- Chat messages -->
+<div class="chat-area" id="chat-area">
+  <div class="chat-inner" id="chat-inner">
+    <div class="empty-chat" id="empty-chat">
+      <div class="icon">✦</div>
+      <p>搜索或提问，知识库会从已有文档中查找答案</p>
+    </div>
+  </div>
+</div>
+
+<!-- Input bar (chat mode) -->
+<div class="input-bar" id="input-bar">
+  <div class="search-box">
+    <button class="btn-icon" onclick="toggleUploadPanel()" title="上传文件">\U0001f4ce</button>
+    <input id="query-input-chat" type="text" placeholder="输入问题，Enter 发送">
+    <div class="actions">
+      <select id="model-select-chat">
+        <option value="ollama">Ollama</option>
+        <option value="deepseek">DeepSeek</option>
+      </select>
+      <button class="btn btn-primary" onclick="doQuery('chat')">发送</button>
+    </div>
+  </div>
+  <div class="focus-row" id="focus-row">
+    <span class="focus-label">聚焦</span>
+    <span id="focus-pills"></span>
   </div>
 </div>
 
@@ -257,42 +372,40 @@ HTML_PAGE = r'''<!DOCTYPE html>
 // State
 var sessionId = localStorage.getItem("gravity_session") || null;
 var currentFocus = null;
-var requestId = 0;        // request dedup counter
-var busy = false;         // global busy lock
+var requestId = 0;
+var busy = false;
+var initialized = false;
 
 // Keyboard shortcuts
-document.getElementById("query-input").addEventListener("keydown", function(e) {
-  if (e.key === "Enter") {
-    if (e.shiftKey) { ask(); } else { search(); }
-  }
-});
+function setupKeyboard() {
+  document.getElementById("query-input-hero").addEventListener("keydown", function(e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doQuery("hero"); }
+  });
+  document.getElementById("query-input-chat").addEventListener("keydown", function(e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doQuery("chat"); }
+  });
+}
 
-// API call with error resilience
+// Safe API call
 async function api(path, body) {
   var res = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  var text = await res.text();  // always read as text first
-  if (!res.ok) {
-    throw new Error(path + " (HTTP " + res.status + "): " + text.slice(0, 300));
-  }
-  try {
-    return JSON.parse(text);
-  } catch(e) {
-    throw new Error(path + ": not JSON: " + text.slice(0, 200));
-  }
+  var text = await res.text();
+  if (!res.ok) throw new Error(path + " (HTTP " + res.status + "): " + text.slice(0, 300));
+  try { return JSON.parse(text); }
+  catch(e) { throw new Error(path + ": not JSON: " + text.slice(0, 200)); }
 }
 
-// Status
+// Status & pills
 async function loadStatus() {
   try {
     var res = await fetch("/status");
-    var text = await res.text();
-    var s = JSON.parse(text);
+    var s = JSON.parse(await res.text());
     document.getElementById("sphere-count").textContent =
-      s.active_spheres + " spheres \u00b7 " + s.fields.length + " fields";
+      s.active_spheres + " spheres · " + s.fields.length + " fields";
     var fields = [];
     for (var key in s.field_counts) {
       fields.push({ name: key, count: s.field_counts[key] });
@@ -308,100 +421,13 @@ function renderPills(fields) {
   for (var i = 0; i < fields.length; i++) {
     var f = fields[i];
     var active = (currentFocus === f.name) ? "active" : "";
-    html += "<button class=\"pill " + active + "\" onclick=\"setFocus('" + f.name + "')\">" + f.name + "</button> ";
+    html += "<button class=\"pill " + active + "\" onclick=\"setFocus('" + f.name.replace(/'/g, "\\'") + "')\">" + escapeHtml(f.name) + "</button> ";
   }
   document.getElementById("focus-pills").innerHTML = html;
-  document.getElementById("exit-focus").style.display = currentFocus ? "inline-block" : "none";
 }
 
-// Search with request dedup
-async function search() {
-  if (busy) { showError("results", "Please wait for current request"); return; }
-  var q = document.getElementById("query-input").value.trim();
-  if (!q) return;
-
-  busy = true;
-  var myReq = ++requestId;
-  document.getElementById("search-btn").disabled = true;
-  document.getElementById("results").innerHTML = "<div class=\"loading\">searching...</div>";
-  document.getElementById("results-title").style.display = "block";
-  document.getElementById("answer-area").style.display = "none";
-  document.getElementById("query-input").focus();
-
-  try {
-    var payload = { query: q, top_k: 5 };
-    if (sessionId) payload.session_id = sessionId;
-    if (currentFocus) payload.field_focus = currentFocus;
-
-    var data = await api("/query", payload);
-    if (myReq !== requestId) return;  // stale, discard
-
-    sessionId = data.session_id;
-    if (sessionId) localStorage.setItem("gravity_session", sessionId);
-    renderResults(data);
-    var sid = data.session_id || "";
-    document.getElementById("session-info").textContent =
-      "session " + sid.slice(0, 8) + "...";
-  } catch(e) {
-    if (myReq === requestId) { showError("results", e.message); }
-  }
-  document.getElementById("search-btn").disabled = false;
-  busy = false;
-}
-
-function renderResults(data) {
-  var r = data.results;
-  if (!r || r.length === 0) {
-    document.getElementById("results").innerHTML =
-      "<div class=\"empty-state\"><div class=\"icon\">&#x1f50d;</div><p>No results found</p></div>";
-    return;
-  }
-  var html = "";
-  if (data.field_affinities) {
-    var affs = Object.entries(data.field_affinities);
-    if (affs.length > 0) {
-      html += "<div class=\"status-bar\">Field affinity: " +
-        affs.map(function(a) { return a[0] + " " + a[1].toFixed(2); }).join(" \u00b7 ") + "</div>";
-    }
-  }
-  for (var i = 0; i < r.length; i++) {
-    var item = r[i];
-    html += "<div class=\"result-card\">";
-    html += "<div class=\"result-meta\">";
-    html += "<span class=\"badge badge-cluster\">" + (item.source_type || "cluster" + item.cluster_id) + "</span>";
-    html += "<span class=\"badge badge-score\">" + (item.score || 0).toFixed(3) + "</span>";
-    if (item.source_file) {
-      html += "<span style=\"color:#cbd5e1\">" + escapeHtml(item.source_file) + "</span>";
-    }
-    html += "</div>";
-    html += "<div class=\"result-text\">" + escapeHtml(item.text) + "</div>";
-    html += "</div>";
-  }
-  document.getElementById("results").innerHTML = html;
-}
-
-function showError(id, msg) {
-  document.getElementById(id).innerHTML =
-    "<div class=\"empty-state\"><p>&#x2716; " + escapeHtml(msg) + "</p></div>";
-}
-
-function escapeHtml(s) {
-  if (!s) return "";
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-// Focus controls
 function setFocus(field) {
-  currentFocus = field;
-  renderPills([]);
-  loadStatus();
-  var q = document.getElementById("query-input").value.trim();
-  if (q) search();
-}
-
-function resetFocus() {
-  currentFocus = null;
-  renderPills([]);
+  currentFocus = (currentFocus === field) ? null : field;
   loadStatus();
 }
 
@@ -409,103 +435,210 @@ function resetFocus() {
 async function loadBackends() {
   try {
     var res = await fetch("/backends");
-    var text = await res.text();
-    var backends = JSON.parse(text);
-    var sel = document.getElementById("model-select");
-    for (var i = 0; i < sel.options.length; i++) {
-      var opt = sel.options[i];
-      if (!backends.available[opt.value]) {
-        opt.disabled = true;
-        opt.textContent += " (offline)";
+    var backends = JSON.parse(await res.text());
+    ["model-select-hero", "model-select-chat"].forEach(function(id) {
+      var sel = document.getElementById(id);
+      for (var i = 0; i < sel.options.length; i++) {
+        var opt = sel.options[i];
+        if (!backends.available[opt.value]) {
+          opt.disabled = true;
+          opt.textContent += " (offline)";
+        }
       }
-    }
+    });
   } catch(e) {}
 }
 
-// Ask
-async function ask() {
-  if (busy) { showError("results", "Please wait for current request"); return; }
-  var q = document.getElementById("query-input").value.trim();
+// Main query (merged search + Q&A)
+async function doQuery(source) {
+  if (busy) return;
+  var inputId = (source === "hero") ? "query-input-hero" : "query-input-chat";
+  var modelId = (source === "hero") ? "model-select-hero" : "model-select-chat";
+  var q = document.getElementById(inputId).value.trim();
   if (!q) return;
 
   busy = true;
   var myReq = ++requestId;
-  document.getElementById("ask-btn").disabled = true;
-  document.getElementById("results-title").style.display = "block";
-  document.getElementById("query-input").focus();
 
-  // Clear previous answer
-  var area = document.getElementById("answer-area");
-  area.style.display = "block";
-  document.getElementById("answer-text").textContent = "Generating...";
-  document.getElementById("answer-text").className = "answer-text";
-  document.getElementById("answer-error").style.display = "none";
-  document.getElementById("results").innerHTML = "";
+  // Switch to chat mode on first query
+  if (!initialized) {
+    document.body.classList.add("chat-mode");
+    initialized = true;
+    setTimeout(function() {
+      document.getElementById("query-input-chat").focus();
+    }, 100);
+  }
+
+  // Add user message bubble
+  var inner = document.getElementById("chat-inner");
+  var empty = document.getElementById("empty-chat");
+  if (empty) empty.style.display = "none";
+
+  var msgGroup = document.createElement("div");
+  msgGroup.className = "msg-group";
+  msgGroup.id = "msg-" + myReq;
+  msgGroup.innerHTML = "<div class=\"msg-user\"><div class=\"label\">You</div>" + escapeHtml(q) + "</div>";
+  inner.appendChild(msgGroup);
+
+  // Add skeleton
+  var skeleton = document.createElement("div");
+  skeleton.className = "msg-assistant";
+  skeleton.id = "skeleton-" + myReq;
+  skeleton.innerHTML = "<div class=\"skeleton skeleton-line\"></div><div class=\"skeleton skeleton-line short\"></div>";
+  msgGroup.appendChild(skeleton);
+
+  // Scroll down
+  document.getElementById("chat-area").scrollTop = document.getElementById("chat-area").scrollHeight;
+
+  // Clear input
+  document.getElementById(inputId).value = "";
+  document.getElementById(inputId).focus();
+
+  // Sync model selector
+  var selectedModel = document.getElementById(modelId).value;
+  document.getElementById("model-select-hero").value = selectedModel;
+  document.getElementById("model-select-chat").value = selectedModel;
 
   try {
     var payload = {
       query: q,
-      model: document.getElementById("model-select").value,
+      model: selectedModel,
       top_k: 5,
     };
     if (sessionId) payload.session_id = sessionId;
+    if (currentFocus) payload.field_focus = currentFocus;
 
     var data = await api("/ask", payload);
-    if (myReq !== requestId) return;  // stale, discard
+    if (myReq !== requestId) return; // stale
 
-    // Track session for follow-ups
+    // Track session
     if (data.session_id) {
       sessionId = data.session_id;
       localStorage.setItem("gravity_session", sessionId);
     }
 
-    document.getElementById("answer-model").innerHTML =
-      "<span class=\"label\">&#x1f916;</span> " + (data.backend || "?") +
-      " <span style=\"color:#94a3b8\">" + (data.model || "") + "</span>";
-    document.getElementById("answer-timing").innerHTML =
-      "<span class=\"label\">&#x26a1;</span> gen " + (data.generation_ms || 0).toFixed(0) + "ms" +
-      " <span style=\"color:#94a3b8\">\u00b7 search " +
-      ((data.retrieval_ms && data.retrieval_ms.total) || 0).toFixed(0) + "ms</span>";
-
-    if (data.error) {
-      document.getElementById("answer-text").className = "answer-error";
-      document.getElementById("answer-text").textContent = "&#x2716; " + data.error;
-    } else {
-      document.getElementById("answer-text").textContent = data.answer || "(no answer)";
-      document.getElementById("session-info").textContent = "session " + (data.session_id || "").slice(0, 8) + "...";
-    }
-
-    if (data.results && data.results.length > 0) {
-      var html = "<div class=\"section-title\">Reference context</div>";
-      for (var i = 0; i < data.results.length; i++) {
-        var item = data.results[i];
-        html += "<div class=\"result-card\"><div class=\"result-meta\">";
-        html += "<span class=\"badge badge-score\">" + (item.score || 0).toFixed(3) + "</span>";
-        html += "<span class=\"badge badge-field\">" + escapeHtml(item.source_type || "") + "</span>";
-        html += "</div><div class=\"result-text\">" + escapeHtml(item.text) + "</div></div>";
-      }
-      document.getElementById("results").innerHTML = html;
-    }
+    // Remove skeleton, render answer + refs
+    var skel = document.getElementById("skeleton-" + myReq);
+    if (skel) skel.remove();
+    renderAnswer(msgGroup, data);
   } catch(e) {
-    if (myReq === requestId) {
-      document.getElementById("answer-text").className = "answer-error";
-      document.getElementById("answer-text").textContent = "&#x2716; " + e.message;
+    var skel = document.getElementById("skeleton-" + myReq);
+    if (skel) {
+      skel.innerHTML = "<div class=\"answer-error\">\u2716 " + escapeHtml(e.message) + "</div>";
     }
   }
-  document.getElementById("ask-btn").disabled = false;
+
+  // Scroll latest message into view
+  if (msgGroup) {
+    setTimeout(function() {
+      msgGroup.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
+  }
+
   busy = false;
 }
 
-// Upload
-async function uploadFile() {
-  if (busy) { showError("results", "Please wait"); return; }
-  var fileInput = document.getElementById("file-upload");
-  var file = fileInput.files[0];
-  if (!file) return;
+function renderAnswer(container, data) {
+  var html = "<div class=\"msg-assistant\">";
 
-  busy = true;
+  // Meta info
+  html += "<div class=\"answer-meta\">";
+  html += "<span><span class=\"label\">\U0001f916</span> " + escapeHtml(data.backend || "?") + " " + (data.model ? "<span style=\"color:#94a3b8\">" + escapeHtml(data.model) + "</span>" : "") + "</span>";
+  if (data.generation_ms) {
+    html += "<span><span class=\"label\">\u26a1</span> " + (data.generation_ms).toFixed(0) + "ms</span>";
+  }
+  html += "</div>";
+
+  // Answer
+  if (data.error) {
+    html += "<div class=\"answer-error\">\u2716 " + escapeHtml(data.error) + "</div>";
+  } else {
+    html += "<div class=\"answer-text\">" + escapeHtml(data.answer || "(no answer)") + "</div>";
+  }
+
+  // Field affinity
+  if (data.field_affinities) {
+    var affs = Object.entries(data.field_affinities);
+    if (affs.length > 0) {
+      html += "<div class=\"affinity-bar\">\u573a\u57df\u4eb2\u548c: " +
+        affs.map(function(a) { return a[0] + " " + Number(a[1]).toFixed(2); }).join(" \u00b7 ") + "</div>";
+    }
+  }
+
+  // Collapsible references
+  if (data.results && data.results.length > 0) {
+    var refId = "ref-" + (requestId);
+    html += "<div class=\"ref-header\" onclick=\"toggleRef('" + refId + "')\">";
+    html += "<span>\U0001f4c4 " + data.results.length + " \u6761\u53c2\u8003\u6765\u6e90</span>";
+    html += "<span class=\"arrow\" id=\"arrow-" + refId + "\">\u25bc</span>";
+    html += "</div>";
+    html += "<div class=\"ref-body\" id=\"" + refId + "\">";
+
+    for (var i = 0; i < data.results.length; i++) {
+      var item = data.results[i];
+      var resultId = refId + "-r" + i;
+      html += "<div class=\"result-card\">";
+      html += "<div class=\"result-meta\">";
+      html += "<span class=\"badge badge-cluster\">" + escapeHtml(item.source_type || "\u7c87" + (item.cluster_id >= 0 ? item.cluster_id : "?")) + "</span>";
+      html += "<span class=\"badge badge-score\">" + (item.score || 0).toFixed(3) + "</span>";
+      if (item.source_file) {
+        html += "<span style=\"color:#cbd5e1\">" + escapeHtml(item.source_file) + "</span>";
+      }
+      html += "</div>";
+      html += "<div class=\"result-text\" id=\"" + resultId + "-text\">" + escapeHtml(item.text) + "</div>";
+      html += "<span class=\"result-expand\" id=\"" + resultId + "-toggle\" onclick=\"toggleResultText('" + resultId + "')\">\u5c55\u5f00\u5168\u90e8</span>";
+      html += "</div>";
+    }
+
+    html += "</div>";
+  }
+
+  html += "</div>";
+  container.innerHTML += html;
+}
+
+function toggleRef(refId) {
+  var body = document.getElementById(refId);
+  var arrow = document.getElementById("arrow-" + refId);
+  if (!body) return;
+  body.classList.toggle("open");
+  if (arrow) arrow.classList.toggle("open");
+}
+
+function toggleResultText(id) {
+  var text = document.getElementById(id + "-text");
+  var toggle = document.getElementById(id + "-toggle");
+  if (!text || !toggle) return;
+  var expanded = text.classList.toggle("expanded");
+  toggle.textContent = expanded ? "\u6536\u8d77" : "\u5c55\u5f00\u5168\u90e8";
+  setTimeout(function() {
+    var group = document.getElementById(refId);
+    if (group) {
+      var container = group.closest('.msg-group');
+      if (container) container.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, 50);
+}
+
+// Upload
+function toggleUploadPanel() {
+  var panel = document.getElementById("upload-panel");
+  panel.classList.toggle("open");
+}
+
+function handleFileSelect(e) {
+  var file = e.target.files[0];
+  if (file) uploadFile(file);
+}
+
+function handleDrop(e) {
+  var file = e.dataTransfer.files[0];
+  if (file) uploadFile(file);
+}
+
+async function uploadFile(file) {
   var statusEl = document.getElementById("upload-status");
-  statusEl.textContent = "&#x2191; Uploading... (" + (file.size / 1024).toFixed(0) + "KB)";
+  statusEl.textContent = "\u2191 Uploading... (" + (file.size / 1024).toFixed(0) + "KB)";
 
   var form = new FormData();
   form.append("file", file);
@@ -516,16 +649,21 @@ async function uploadFile() {
     var text = await res.text();
     if (!res.ok) throw new Error(text.slice(0, 200));
     var data = JSON.parse(text);
-    statusEl.textContent = "&#x2713; " + data.new_spheres + " new spheres (" + data.timing_ms.total.toFixed(0) + "ms)";
+    statusEl.textContent = "\u2713 " + data.new_spheres + " new spheres (" + data.timing_ms.total.toFixed(0) + "ms)";
     loadStatus();
   } catch(e) {
-    statusEl.textContent = "&#x2716; Upload failed: " + e.message;
+    statusEl.textContent = "\u2716 " + e.message;
   }
-  busy = false;
-  fileInput.value = "";
+}
+
+// Helpers
+function escapeHtml(s) {
+  if (!s) return "";
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 // Init
+setupKeyboard();
 loadBackends();
 loadStatus();
 </script>
@@ -662,6 +800,9 @@ class AppState:
         self.sphere_store = SphereStore()
         self.field_detector = FieldDetector()
         self.sorter = DiversitySorter()
+        self.rewriter = TextRewriter()
+        self.calibrator = SphereCalibrator()
+        self.conn_detector = None  # 启动时按需创建
         self.retriever = Retriever(
             embedder=self.embedder,
             faiss_store=self.faiss_store,
@@ -669,6 +810,7 @@ class AppState:
             sphere_store=self.sphere_store,
             field_detector=self.field_detector,
             diversity_sorter=self.sorter,
+            rewriter=self.rewriter,
         )
         self.uploads_dir = Path(cfg_paths.uploads_dir)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -676,6 +818,17 @@ class AppState:
         self.sessions = SessionManager()
         self.cluster_engine = ClusterEngine()
         self.generator = AnswerGenerator()
+
+    def ensure_connections(self):
+        """按需初始化连接检测器并挂载到 retriever"""
+        if self.conn_detector is None:
+            from pipeline.connections import ConnectionDetector
+            self.conn_detector = ConnectionDetector(
+                self.sphere_store, self.faiss_store._vectors
+            )
+            self.conn_detector.load()
+            self.retriever.attach_connections(self.conn_detector.get_connections)
+            self.calibrator.attach(self.sphere_store, self.faiss_store._vectors)
 
     def is_loaded(self) -> bool:
         return self.faiss_store.is_built
@@ -696,6 +849,10 @@ class QueryRequest(BaseModel):
     field_focus: Optional[str] = None    # 聚焦某场域（null=不聚焦）
     reset_focus: bool = False            # 退出聚焦
     exclude_ids: Optional[List[str]] = None  # 排除已返回的球体
+    mode: str = "gravity"               # simple | gravity | deep
+    use_activation: Optional[bool] = None # 覆盖激活传播开关
+    use_reranker: Optional[bool] = None   # 覆盖重排器开关
+    max_hops: int = 2                     # 激活传播跳数
 
 
 class QueryResponse(BaseModel):
@@ -719,7 +876,7 @@ class UploadResponse(BaseModel):
 class AskRequest(BaseModel):
     query: str
     model: str = ""                         # 空=用配置默认值
-    top_k: int = 5
+    top_k: int = 15                          # 给模型更多上下文（排序靠前的最相关）
     field_focus: Optional[str] = None
     session_id: Optional[str] = None
 
@@ -1240,12 +1397,20 @@ async def query(request: QueryRequest):
     if session:
         exclude |= session.exclude_ids
 
+    # 确保连接层已初始化（如果是 gravity/deep 模式）
+    if request.mode in ("gravity", "deep"):
+        state.ensure_connections()
+
     result: RetrievalResult = state.retriever.retrieve(
         query=request.query,
         top_k=request.top_k,
         fetch_k=request.fetch_k,
         field_focus=effective_focus,
         exclude_ids=list(exclude),
+        mode=request.mode,
+        use_activation=request.use_activation,
+        use_reranker=request.use_reranker,
+        max_hops=request.max_hops,
     )
 
     # 记录返回的球体 ID 到会话
@@ -1293,11 +1458,15 @@ async def ask(request: AskRequest):
     session = state.sessions.get_or_create(request.session_id)
     history_text = session.history_text
 
-    # 1. 检索上下文
+    # 1. 检索上下文（纯 FAISS 相似度）
+    # 使用 gravity 模式获取更丰富的上下文
+    state.ensure_connections()
     retrieval_result: RetrievalResult = state.retriever.retrieve(
         query=request.query,
         top_k=request.top_k,
         field_focus=request.field_focus,
+        mode="gravity",
+        use_reranker=False,
     )
 
     # 2. 提取上下文文本
@@ -1424,6 +1593,140 @@ async def rebuild():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Rebuild failed: {e}")
+
+
+# ──────────────────────────────────────────────
+# 端点：重写文本
+# ──────────────────────────────────────────────
+
+@app.post("/rewrite")
+async def api_rewrite(text: str = Form(...), source_type: str = Form(""),
+                      source_file: str = Form("")):
+    """手动重写一段文本（入库前清洁）"""
+    try:
+        clean = state.rewriter.rewrite(text, source_type, source_file)
+        return {
+            "status": "ok",
+            "cleaned_text": clean.cleaned_text,
+            "entities": clean.entities,
+            "title": clean.title,
+            "summary": clean.summary,
+            "sections": clean.sections,
+            "source_type": clean.source_type,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Rewrite failed: {e}")
+
+
+# ──────────────────────────────────────────────
+# 端点：重建连接
+# ──────────────────────────────────────────────
+
+@app.post("/rebuild-connections")
+async def api_rebuild_connections():
+    """全量重建球体连接网络"""
+    state.ensure_connections()
+    try:
+        total = state.conn_detector.detect_batch()
+        state.conn_detector.save()
+        return {
+            "status": "ok",
+            "total_connections": total,
+            "avg_degree": round(state.conn_detector.avg_degree, 2),
+            "total_nodes": len(state.conn_detector._connections),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Rebuild connections failed: {e}")
+
+
+# ──────────────────────────────────────────────
+# 端点：校准 mass/diversity
+# ──────────────────────────────────────────────
+
+@app.post("/calibrate")
+async def api_calibrate():
+    """触发球体质量与多样性校准"""
+    state.ensure_connections()
+    try:
+        result = state.calibrator.calibrate_all()
+        state.sphere_store.save()
+        return {
+            "status": "ok",
+            "calibrated": result["calibrated"],
+            "mass_range": result["mass_range"],
+            "diversity_range": result["diversity_range"],
+            "avg_degree": result["avg_degree"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Calibrate failed: {e}")
+
+
+# ──────────────────────────────────────────────
+# 端点：球体导航
+# ──────────────────────────────────────────────
+
+@app.get("/navigate/{sphere_id}")
+async def api_navigate(sphere_id: str, hops: int = 2):
+    """从指定球体出发导航连接图"""
+    state.ensure_connections()
+    result = navigate_sphere(
+        sphere_id=sphere_id,
+        sphere_store=state.sphere_store,
+        connections_provider=state.conn_detector.get_connections,
+        hops=hops,
+    )
+    return result
+
+
+# ──────────────────────────────────────────────
+# 端点：聚簇展开
+# ──────────────────────────────────────────────
+
+@app.get("/explore/{cluster_id}")
+async def api_explore(cluster_id: int, sort_by: str = "mass", top_k: int = 30):
+    """展开一个聚簇的全部内容"""
+    result = explore_cluster(
+        cluster_id=cluster_id,
+        sphere_store=state.sphere_store,
+        field_detector=state.field_detector,
+        sort_by=sort_by,
+        top_k=top_k,
+    )
+    return result
+
+
+# ──────────────────────────────────────────────
+# 端点：会话时间线
+# ──────────────────────────────────────────────
+
+@app.get("/trace")
+async def api_trace(source_file: str):
+    """还原一个会话的时间线"""
+    state.ensure_connections()
+    result = trace_conversation(
+        source_file=source_file,
+        sphere_store=state.sphere_store,
+        connections_provider=state.conn_detector.get_connections if state.conn_detector else None,
+    )
+    return result
+
+
+# ──────────────────────────────────────────────
+# 端点：球体路径发现
+# ──────────────────────────────────────────────
+
+@app.get("/bridge/{sphere_a}/{sphere_b}")
+async def api_bridge(sphere_a: str, sphere_b: str):
+    """找两个球体之间的最短路径"""
+    state.ensure_connections()
+    result = find_bridge(
+        sphere_a=sphere_a,
+        sphere_b=sphere_b,
+        sphere_store=state.sphere_store,
+        connections_provider=state.conn_detector.get_connections,
+        max_hops=4,
+    )
+    return result
 
 
 # ──────────────────────────────────────────────

@@ -19,6 +19,7 @@ class Paths:
     registry_map: str = "data/spheres/registry.json"
     uploads_dir: str = "data/uploads/"
     wal_dir: str = "data/wal/"
+    connections_dir: str = "data/connections/"
 
 
 # ──────────────────────────────────────────────
@@ -27,23 +28,19 @@ class Paths:
 @dataclass
 class OllamaConfig:
     host: str = "http://localhost:11434"
-    embed_model: str = "nomic-embed-text"       # 嵌入模型
-    embed_dim: int = 768                         # 模型输出维度
-    llm_model: str = "qwen2.5:7b"               # 回答生成模型
-    llm_temperature: float = 0.3                 # 低温度→稳定回答
+    embed_model: str = "nomic-embed-text"
+    embed_dim: int = 768
+    llm_model: str = "qwen2.5:7b"
+    llm_temperature: float = 0.3
     llm_max_tokens: int = 2048
-    embed_timeout: int = 30                      # 嵌入请求超时（秒）
-    llm_timeout: int = 120                       # 生成请求超时（秒）
+    embed_timeout: int = 30
+    llm_timeout: int = 120
 
-    # nomic-embed-text 的 task prefix（不加会影响检索精度）
     embed_doc_prefix: str = "search_document: "
     embed_query_prefix: str = "search_query: "
 
-    # 批处理参数
-    embed_batch_size: int = 16                   # 一批最多处理多少条
-
-    # 缓存
-    embed_cache_size: int = 10000               # 最大缓存条目数
+    embed_batch_size: int = 16
+    embed_cache_size: int = 10000
 
 
 # ──────────────────────────────────────────────
@@ -51,30 +48,19 @@ class OllamaConfig:
 # ──────────────────────────────────────────────
 @dataclass
 class ChunkerConfig:
-    """
-    基于 Recursive Character Chunking（LangChain 标准方案）
-
-    递归降级策略：
-      \n\n → \n → 句子边界 → 长词 → 字符
-    每次按当前最高优先级分隔符切分，块太大则降级到下一级分隔符。
-    """
-    mode: str = "recursive"                     # recursive | markdown | fixed
-    max_chunk_chars: int = 800                  # 目标块上限（字符数）
-    chunk_overlap: int = 100                    # 相邻块重叠字符数
-    # 递归分隔符优先级（从高到低）
+    mode: str = "recursive"
+    max_chunk_chars: int = 2000
+    chunk_overlap: int = 300
     separators: List[str] = field(default_factory=lambda: [
-        "\n\n",   # 段落边界（最高优先级）
-        "\n",      # 行边界
-        "。\n",    # 中文句号
-        ". ",      # 英文句点
-        "！", "？", # 中文感叹/疑问
-        "!", "?",   # 英文感叹/疑问
-        "；", ";",  # 分号
-        "，", ",",  # 逗号
-        " ",        # 空格（词边界）
-        "",         # 字符级硬切（最后退路）
+        "\n\n", "\n", "。\n", ". ", "！", "？", "!", "?", "；", ";", "，", ",", " ", "",
     ])
-    # 不做 min_chunk 过滤——短块也是有效信息单元
+
+    # 按 source_type 的差异化策略
+    strategy_overrides: dict = field(default_factory=lambda: {
+        "会话记录": {"mode": "section", "max_chars": 1500, "overlap": 200},
+        "技术笔记": {"mode": "markdown", "max_chars": 2500, "overlap": 200},
+        "会话记录_重写": {"mode": "section", "max_chars": 1500, "overlap": 200},
+    })
 
 
 # ──────────────────────────────────────────────
@@ -82,12 +68,11 @@ class ChunkerConfig:
 # ──────────────────────────────────────────────
 @dataclass
 class RetrievalConfig:
-    faiss_top_k: int = 100                      # FAISS 粗搜返回数量
-    final_top_k: int = 5                        # 多样性排序后最终输出数量
-    field_match_threshold: float = 0.3          # 低于此值的场域匹配度不计分
-    diversity_weight: float = 0.4               # 多样性在最终评分中的权重
-    similarity_weight: float = 0.6              # FAISS 相似度在最终评分中的权重
-    # 场域匹配度 = 1 - 权重，所以场域权重 = similarity_weight × (1 - 权重偏移)
+    faiss_top_k: int = 100
+    final_top_k: int = 5
+    field_match_threshold: float = 0.3
+    diversity_weight: float = 0.4
+    similarity_weight: float = 0.6
 
 
 # ──────────────────────────────────────────────
@@ -105,19 +90,13 @@ class WebConfig:
 # ──────────────────────────────────────────────
 @dataclass
 class ClusteringConfig:
-    """k-means 聚类参数
-
-    场域不再由用户打标签定义，而是系统通过聚类自动发现。
-    上传完成后触发全量重聚类，更新每个球体的簇归属。
-    """
-    n_clusters: int = 3            # 聚簇数量（auto_detect=True 时作为参考/最小值）
-    auto_detect_k: bool = True     # 是否自动检测最优 K 值（silhouette score）
-    max_k: int = 20                # 自动检测时的最大 K 上限
-    max_iter: int = 100            # 最大迭代次数
-    random_state: int = 42         # 固定种子，保证可复现
-    n_init: int = 10               # 初始化次数（选最佳）
-    cluster_threshold: float = 0.3 # 低于此值的球体视为未分配
-    # 存储路径
+    n_clusters: int = 3
+    auto_detect_k: bool = True
+    max_k: int = 20
+    max_iter: int = 100
+    random_state: int = 42
+    n_init: int = 10
+    cluster_threshold: float = 0.3
     state_file: str = "data/clusters/cluster_state.json"
     label_map_file: str = "data/clusters/cluster_labels.json"
 
@@ -127,23 +106,13 @@ class ClusteringConfig:
 # ──────────────────────────────────────────────
 @dataclass
 class GenerationConfig:
-    """多后端生成器配置
-
-    model 取值:
-      ollama   — 本地 Ollama LLM（默认 qwen2.5:7b）
-      deepseek — DeepSeek V4 Pro 云端 API
-      agent    — 扩展接口（预留，接入自定义生成服务）
-    """
-    default_model: str = "ollama"           # ollama | deepseek | agent
-
-    # --- Ollama 本地 ---
+    default_model: str = "ollama"
     ollama_model: str = "qwen2.5:7b"
     ollama_temperature: float = 0.3
     ollama_max_tokens: int = 2048
     ollama_timeout: int = 120
 
-    # --- DeepSeek 云端 ---
-    deepseek_api_key: str = ""               # 从环境变量读取，或手动填
+    deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-v4-pro"
     deepseek_temperature: float = 0.3
@@ -152,12 +121,93 @@ class GenerationConfig:
 
 
 # ──────────────────────────────────────────────
-# 场域配置（已迁移至聚类自动发现）
+# 文本重写配置（Phase 0.1 新增）
 # ──────────────────────────────────────────────
-# 此列表不再作为场域定义，仅用于：
-#   1. 历史数据兼容（旧 source_type 保留不删）
-#   2. 聚类结果的初始命名参考
-# 空列表不影响系统运行，聚类引擎会自行发现簇。
+@dataclass
+class RewriterConfig:
+    """入库前文本重写器参数"""
+    enabled: bool = True
+    llm_model: str = "qwen2.5:7b"
+    # 走全量重写的 source_type（LLM结构化+指代消解）
+    full_strategies: List[str] = field(default_factory=lambda: [
+        "会话记录", "其他", ""
+    ])
+    # 走轻量重写的 source_type（只做实体提取）
+    light_strategies: List[str] = field(default_factory=lambda: [
+        "技术笔记", "学术论文", "工作文档"
+    ])
+    max_input_chars: int = 4000
+    batch_delay: float = 0.5           # Ollama 批次间冷却时间（秒）
+    timeout: int = 60
+
+
+# ──────────────────────────────────────────────
+# 球体连接配置（Phase 0.3 新增）
+# ──────────────────────────────────────────────
+@dataclass
+class ConnectionConfig:
+    """球体间关系检测参数"""
+    enabled: bool = True
+    same_cluster_topk: int = 3          # 同簇取 Top-N 建连接
+    same_cluster_weight: float = 0.6    # 同簇连接权重
+    entity_threshold: int = 2           # 共享实体 ≥ 此数则建连接
+    entity_weight: float = 0.4          # 实体重叠连接权重
+    embedding_threshold: float = 0.80   # 跨簇语义相似度阈值
+    embedding_weight: float = 0.3       # 跨簇语义连接权重
+    temporal_weight: float = 0.25       # 时序相邻连接权重
+    cross_cluster_weight: float = 0.2   # 跨簇桥接权重
+    min_weight: float = 0.1             # 低于此值不建连接
+    prune_threshold: float = 0.05       # 季度修剪阈值
+    max_connections_per_sphere: int = 50  # 单球体连接数上限
+    decay_per_tick: float = 0.98        # 每 tick 连接衰减系数
+    storage_dir: str = "data/connections/" # 连接表持久化目录
+    batch_build_size: int = 50          # 批量构建时的批次大小
+
+
+# ──────────────────────────────────────────────
+# 激活传播配置（Phase 1.1 新增）
+# ──────────────────────────────────────────────
+@dataclass
+class ActivationConfig:
+    """检索时球体激活传播参数"""
+    enabled: bool = True
+    max_hops: int = 2                   # 最大传播跳数
+    decay_factor: float = 0.5           # 每跳信号衰减系数
+    seed_activation_threshold: float = 0.05   # 种子激活阈值
+    min_propagated: float = 0.02        # 传播信号最低保留值
+    max_candidates_before: int = 100    # 传播前的候选数（FAISS返回数）
+    max_candidates_after: int = 150     # 传播后的候选数上限
+
+
+# ──────────────────────────────────────────────
+# 重排序配置（Phase 1.4 新增）
+# ──────────────────────────────────────────────
+@dataclass
+class RerankerConfig:
+    """检索后候选重排序参数"""
+    enabled: bool = True
+    method: str = "ollama"              # ollama | cross-encoder
+    model: str = "qwen2.5:7b"           # ollama 方案用此模型
+    candidate_count: int = 50           # 重排前截断到此数
+    top_k_after: int = 20               # 重排后保留数量
+    batch_size: int = 5                 # Ollama 每次评分几个候选
+
+
+# ──────────────────────────────────────────────
+# 球体质量校准配置（Phase 0.2 新增）
+# ──────────────────────────────────────────────
+@dataclass
+class CalibratorConfig:
+    """mass/diversity 校准参数"""
+    mass_base: float = 1.0
+    mass_connection_factor: float = 0.3   # 连接度对 mass 的贡献
+    mass_max_multiplier: float = 3.0      # mass 最大值倍数
+    diversity_effective_factor: float = 0.5  # diversity 对 effective_mass 的贡献系数
+
+
+# ──────────────────────────────────────────────
+# 场域配置（历史兼容）
+# ──────────────────────────────────────────────
 AVAILABLE_FIELDS: List[str] = [
     "技术笔记",
     "小说创作",
@@ -177,3 +227,8 @@ retrieval = RetrievalConfig()
 web = WebConfig()
 clustering = ClusteringConfig()
 generation = GenerationConfig()
+rewriter = RewriterConfig()
+connection = ConnectionConfig()
+activation = ActivationConfig()
+reranker = RerankerConfig()
+calibrator = CalibratorConfig()

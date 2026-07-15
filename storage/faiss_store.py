@@ -158,13 +158,23 @@ class FaissStore:
 
         distances, ids = self._index.search(query_vector, k)
 
-        # 从缓存中获取对应向量
-        vecs = np.vstack([
-            self._vectors[int(fid)]
-            for fid in ids[0]
-        ])
+        # 从缓存中获取对应向量（容缺：缓存中没有的向量用零向量填充）
+        valid_vecs = []
+        valid_ids = []
+        valid_dists = []
+        for fid, dist in zip(ids[0], distances[0]):
+            vec = self._vectors.get(int(fid))
+            if vec is not None:
+                valid_vecs.append(vec)
+                valid_ids.append(fid)
+                valid_dists.append(dist)
 
-        return ids[0], distances[0], vecs
+        if valid_vecs:
+            vecs = np.vstack(valid_vecs)
+        else:
+            vecs = np.zeros((0, self.dim), dtype=np.float32)
+
+        return np.array(valid_ids, dtype=np.int64), np.array(valid_dists, dtype=np.float32), vecs
 
     # ── 删除 ──────────────────────────────────
 

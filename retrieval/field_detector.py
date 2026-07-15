@@ -183,6 +183,52 @@ class FieldDetector:
         # 降序排列
         return dict(sorted(scores.items(), key=lambda x: -x[1]))
 
+    def gravity_focus(
+        self,
+        query_vector: np.ndarray,
+        candidates_spheres: List,
+        strength: float = 0.2,
+        top_n: int = 2,
+    ) -> List[float]:
+        """对候选球体施加场域引力
+
+        思路：
+          - 检测 query 的场域亲和度
+          - 对每个候选球体，检查它的 gravity_field 是否与 query 匹配
+          - 匹配的球体获得 mass 增益（effective_mass *= 1 + strength * affinity）
+
+        Args:
+            query_vector: 查询向量
+            candidates_spheres: 候选 Sphere 对象列表
+            strength: 引力强度系数 (0~1)
+            top_n: 取前 N 个匹配场域
+
+        Returns:
+            [multiplier, ...] 每个候选的 mass 乘数
+            1.0 = 无增益, >1.0 = 引力增益
+        """
+        affinities = self.detect(query_vector)
+        if not affinities or not candidates_spheres:
+            return [1.0] * len(candidates_spheres)
+
+        # 取 top-N 场域
+        top_fields = list(affinities.keys())[:top_n]
+
+        multipliers = []
+        for sphere in candidates_spheres:
+            # 球体对 top 场域的引力匹配
+            match = 0.0
+            for field in top_fields:
+                field_val = sphere.gravity_field.get(field, 0)
+                query_val = affinities.get(field, 0)
+                match += field_val * query_val
+
+            # 引力增益：1 + strength x match
+            multiplier = 1.0 + strength * match
+            multipliers.append(round(multiplier, 4))
+
+        return multipliers
+
     def best_field(self, query_vector: np.ndarray) -> tuple:
         """返回最匹配的场域和分数
 
