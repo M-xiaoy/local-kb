@@ -827,7 +827,10 @@ class AppState:
                 self.sphere_store, self.faiss_store._vectors
             )
             self.conn_detector.load()
-            self.retriever.attach_connections(self.conn_detector.get_connections)
+            self.retriever.attach_connections(
+                self.conn_detector.get_connections,
+                type_checker=self.conn_detector.get_connection_type,
+            )
             self.calibrator.attach(self.sphere_store, self.faiss_store._vectors)
 
     def is_loaded(self) -> bool:
@@ -1130,7 +1133,7 @@ async def upload_file(
     if result.file_type == "md":
         raw_chunks = chunk_markdown(result.text)
     else:
-        raw_chunks = chunk_text(result.text)
+        raw_chunks = chunk_text(result.text, source_type=source_type)
     chunks = [c for c in raw_chunks if c.strip()]
     timings["chunk"] = time.time() - t2
 
@@ -1634,9 +1637,27 @@ async def api_rebuild_connections():
             "total_connections": total,
             "avg_degree": round(state.conn_detector.avg_degree, 2),
             "total_nodes": len(state.conn_detector._connections),
+            "axon_edges": len(state.conn_detector._axon_types),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Rebuild connections failed: {e}")
+
+
+@app.post("/rebuild-axon")
+async def api_rebuild_axon():
+    """仅重建轴突（因果链）连接，不重建树突"""
+    state.ensure_connections()
+    try:
+        total = state.conn_detector.detect_axon_batch()
+        state.conn_detector.save()
+        return {
+            "status": "ok",
+            "axon_connections": total,
+            "total_edges": state.conn_detector.total_edges,
+            "axon_edges": len(state.conn_detector._axon_types),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Rebuild axon failed: {e}")
 
 
 # ──────────────────────────────────────────────

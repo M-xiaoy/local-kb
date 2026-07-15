@@ -47,8 +47,11 @@ def chunk_text(text: str, source_type: str = "",
     max_chars = overrides.get("max_chars", cfg.max_chunk_chars)
     overlap = overrides.get("overlap", cfg.chunk_overlap)
 
+    # 因果密度模式（v2 新增：基于实验结论的智能切分）
+    if mode == "causal_density":
+        return _chunk_by_causal_density(text, max_chars, overlap)
     # Section 模式（优先使用，有 sections 才走）
-    if mode == "section" and sections:
+    elif mode == "section" and sections:
         return _chunk_by_sections(text, sections, max_chars, overlap)
     # Markdown 模式
     elif mode == "markdown":
@@ -274,6 +277,139 @@ class RecursiveChunker:
 
     def chunk_markdown(self, text: str) -> List[str]:
         return _chunk_markdown(text, self.max_size, self.overlap)
+
+
+# ──────────────────────────────────────────────
+# 因果密度模式（v2 新增）
+# ──────────────────────────────────────────────
+
+# 因果标记词（与 connections.py 同步）
+CAUSE_MARKERS = [
+    "propose", "demonstrate", "therefore", "enable",
+    "we show that", "our results indicate",
+    "this demonstrates", "this confirms that",
+    "we conclude that", "results in", "leads to",
+    "suggesting that", "indicating that", "this implies",
+    "these findings suggest", "we report the",
+]
+
+# 果句标记词
+EFFECT_MARKERS = [
+    "we demonstrate", "we show", "we find", "our results",
+    "this leads", "demonstrates that", "shows that",
+    "confirms", "achieves", "improves", "outperforms",
+    "enables", "provides", "yields", "results in",
+]
+
+
+def _has_causal_chain(paragraph: str) -> bool:
+    """检测段落内是否存在因果链（因句→果句，距离 ≤ 2 句）
+
+    基于实验结论：因果链均为段落内，平均跨 2 句。
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
+
+    for si, sent in enumerate(sentences):
+        lower = sent.lower()[:100]
+        # 检查是否含因果标记
+        has_cause = any(m in lower for m in CAUSE_MARKERS)
+        if not has_cause:
+            continue
+
+        # 向后 max_gap=2 句范围内找果句
+        for sj in range(si + 1, min(si + 3, len(sentences))):
+            target = sentences[sj].lower()[:100]
+            has_effect = any(m in target for m in EFFECT_MARKERS)
+            if has_effect:
+                return True
+
+            # 果句也可能含因果标记（因果对被称为完整）
+            has_cause2 = any(m in target for m in CAUSE_MARKERS)
+            if has_cause2 and sj < si + 2:
+                return True
+
+    return False
+
+
+def _chunk_by_causal_density(text: str, max_chars: int,
+                              overlap: int) -> List[str]:
+    """按因果密度动态切分
+
+    算法：
+      1. 按段落为单位扫描
+      2. 检测每段是否含因果链
+      3. 含因果链的段落标记为 causal_block，独立成球体
+      4. 无因果链的段落合并到相邻 causal_block（前向优先）
+      5. 过长的 causal_block 降级到 recursive
+
+    基于实验：
+      - 因果链均为段落内（barrier=0）
+      - 平均跨 2 句
+      - 含因果链的段落应保留为独立知识单元
+    """
+    paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip()) > 30]
+
+    if len(paragraphs) <= 1:
+        # 单段全文→无因果密度信息，降级到 recursive
+        return _chunk_recursive(text, max_chars, overlap)
+
+    # 第 1 轮：扫描因果链
+    para_flags = []  # (text, is_causal)
+    for para in paragraphs:
+        is_causal = _has_causal_chain(para)
+        para_flags.append((para, is_causal))
+
+    # 第 2 轮：合并非因果段到相邻因果段
+    merged = []
+    buffer = ""
+    buffer_has_causal = False
+
+    for para, is_causal in para_flags:
+        if not buffer:
+            buffer = para
+            buffer_has_causal = is_causal
+            continue
+
+        # 非因果段 → 合并到 buffer（前向合并）
+        if not is_causal and len(buffer) + len(para) < max_chars * 1.5:
+            buffer += "\n\n" + para
+            continue
+
+        # 因果段 + buffer 已有因果 → 两个因果块
+        if buffer_has_causal and is_causal:
+            merged.append(buffer.strip())
+            buffer = para
+            buffer_has_causal = True
+            continue
+
+        # 缓冲满 → 输出
+        if len(buffer) >= max_chars:
+            merged.append(buffer.strip())
+            buffer = para
+            buffer_has_causal = is_causal
+            continue
+
+        # 默认：合并
+        buffer += "\n\n" + para
+        buffer_has_causal = buffer_has_causal or is_causal
+
+    if buffer:
+        merged.append(buffer.strip())
+
+    # 第 3 轮：过长的 chunk 降级
+    final = []
+    for chunk in merged:
+        if len(chunk) <= max_chars:
+            final.append(chunk)
+        else:
+            final.extend(_chunk_recursive(chunk, max_chars, overlap))
+
+    # 如果因果密度切分出来和原始没区别（全粘一起），降级
+    if len(final) <= 1 and len(paragraphs) > 3:
+        return _chunk_recursive(text, max_chars, overlap)
+
+    return final
 
 
 # 快捷函数（向后兼容）

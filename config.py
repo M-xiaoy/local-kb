@@ -60,6 +60,7 @@ class ChunkerConfig:
         "会话记录": {"mode": "section", "max_chars": 1500, "overlap": 200},
         "技术笔记": {"mode": "markdown", "max_chars": 2500, "overlap": 200},
         "会话记录_重写": {"mode": "section", "max_chars": 1500, "overlap": 200},
+        "学术论文": {"mode": "causal_density", "max_chars": 2000, "overlap": 200},
     })
 
 
@@ -81,7 +82,7 @@ class RetrievalConfig:
 @dataclass
 class WebConfig:
     host: str = "0.0.0.0"
-    port: int = 8765
+    port: int = 8766
     upload_max_size_mb: int = 50
 
 
@@ -90,7 +91,7 @@ class WebConfig:
 # ──────────────────────────────────────────────
 @dataclass
 class ClusteringConfig:
-    n_clusters: int = 3
+    n_clusters: int = 5
     auto_detect_k: bool = True
     max_k: int = 20
     max_iter: int = 100
@@ -152,7 +153,7 @@ class ConnectionConfig:
     same_cluster_weight: float = 0.6    # 同簇连接权重
     entity_threshold: int = 2           # 共享实体 ≥ 此数则建连接
     entity_weight: float = 0.4          # 实体重叠连接权重
-    embedding_threshold: float = 0.80   # 跨簇语义相似度阈值
+    embedding_threshold: float = 0.50   # 跨簇语义相似度阈值（v2 实验：0.65 太紧）
     embedding_weight: float = 0.3       # 跨簇语义连接权重
     temporal_weight: float = 0.25       # 时序相邻连接权重
     cross_cluster_weight: float = 0.2   # 跨簇桥接权重
@@ -162,6 +163,20 @@ class ConnectionConfig:
     decay_per_tick: float = 0.98        # 每 tick 连接衰减系数
     storage_dir: str = "data/connections/" # 连接表持久化目录
     batch_build_size: int = 50          # 批量构建时的批次大小
+
+
+# ──────────────────────────────────────────────
+# 轴突连接配置（Phase 1.2 新增 — 因果链检测）
+# ──────────────────────────────────────────────
+@dataclass
+class AxonConfig:
+    """段落内因果链 → 轴突连接的参数"""
+    enabled: bool = True
+    max_sentence_distance: int = 3       # 因句向后找果句的最大句数
+    axon_weight_strong: float = 0.6     # 强因果标记（propose/demonstrate）的连接权重
+    axon_weight_weak: float = 0.35      # 弱因果标记（suggest/indicate）的连接权重
+    decay_angle_threshold: float = 55.0 # 衰减临界角阈值（实验验证值）
+    use_embedding_verify: bool = True   # 是否用向量相似度验证因果对
 
 
 # ──────────────────────────────────────────────
@@ -229,6 +244,7 @@ clustering = ClusteringConfig()
 generation = GenerationConfig()
 rewriter = RewriterConfig()
 connection = ConnectionConfig()
+axon = AxonConfig()
 activation = ActivationConfig()
 reranker = RerankerConfig()
 calibrator = CalibratorConfig()

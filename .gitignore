@@ -11,6 +11,9 @@ data/spheres/
 data/uploads/
 data/wal/
 data/clusters/
+data/connections/
+data/gravity_lab/
+data/raw_arxiv/
 data_backup_*/
 
 # Runtime

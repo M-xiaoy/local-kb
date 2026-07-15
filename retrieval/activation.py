@@ -39,6 +39,7 @@ class ActivationPropagator:
     def __init__(
         self,
         connections_provider: Optional[Callable[[str], Dict[str, float]]] = None,
+        type_checker: Optional[Callable[[str, str], str]] = None,
         max_hops: Optional[int] = None,
         decay: Optional[float] = None,
         activation_threshold: Optional[float] = None,
@@ -47,20 +48,28 @@ class ActivationPropagator:
         """
         Args:
             connections_provider: 函数, 输入 sphere_id, 返回 {neighbor_id: weight}
+            type_checker: 函数 (a, b) -> "axon:forward" | "axon:reverse" | "dendrite"
+                         轴突连接处理：
+                           - forward: 不衰减（因果链完整传导）
+                           - reverse: 半衰减（反向传导需谨慎）
+                           - dendrite/bidirectional: 按原衰减系数
             max_hops: 最大传播跳数
             decay: 每跳衰减系数
             activation_threshold: 种子激活阈值（低于此值不传播）
             min_propagated: 传播信号保留阈值（低于此值不记录）
         """
         self._conn_provider = connections_provider
+        self._type_checker = type_checker or (lambda a, b: "dendrite")
         self.max_hops = max_hops or cfg.max_hops
         self.decay = decay or cfg.decay_factor
         self.activation_threshold = activation_threshold or cfg.seed_activation_threshold
         self.min_propagated = min_propagated or cfg.min_propagated
 
-    def attach(self, connections_provider):
+    def attach(self, connections_provider, type_checker=None):
         """延迟关联连接提供者"""
         self._conn_provider = connections_provider
+        if type_checker:
+            self._type_checker = type_checker
 
     # ── 主入口 ───────────────────────────────
 
@@ -116,8 +125,20 @@ class ActivationPropagator:
                     if neighbor_id in visited:
                         continue
 
+                    # 轴突连接按方向处理
+                    conn_type = self._type_checker(sphere_id, neighbor_id)
+                    if conn_type.startswith("axon"):
+                        if conn_type == "axon:forward":
+                            actual_decay = 1.0  # 正向因果链不衰减
+                        elif conn_type == "axon:reverse":
+                            actual_decay = self.decay * 0.8  # 反向传导衰减更多
+                        else:  # axon:bidirectional
+                            actual_decay = self.decay * 0.9  # 无方向标记时保守衰减
+                    else:
+                        actual_decay = self.decay  # 树突正常衰减
+
                     # 传播信号 = 当前激活 × 连接权重 × 衰减
-                    propagated = activation * conn_weight * self.decay
+                    propagated = activation * conn_weight * actual_decay
 
                     if propagated >= self.min_propagated:
                         # 多路径叠加

@@ -98,10 +98,10 @@ class Retriever:
         if self.propagator._conn_provider is None and connections_provider:
             self.propagator.attach(connections_provider)
 
-    def attach_connections(self, provider: Callable):
+    def attach_connections(self, provider: Callable, type_checker: Optional[Callable] = None):
         """关联连接提供者"""
         self._conn_provider = provider
-        self.propagator.attach(provider)
+        self.propagator.attach(provider, type_checker=type_checker)
 
     # ── 检索主入口 ───────────────────────────
 
