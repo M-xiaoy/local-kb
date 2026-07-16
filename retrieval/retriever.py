@@ -27,7 +27,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from config import retrieval as cfg_retrieval, activation as cfg_activation
+from config import retrieval as cfg_retrieval, activation as cfg_activation, role as cfg_role
 from pipeline.embedder import Embedder
 from pipeline.keywords import extract_from_query, match_term_gravity
 from pipeline.rewriter import TextRewriter
@@ -38,6 +38,7 @@ from retrieval.field_detector import FieldDetector
 from retrieval.diversity_sorter import DiversitySorter
 from retrieval.activation import ActivationPropagator
 from retrieval.reranker import LocalReranker
+from retrieval.role_expander import RoleExpander
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ class Retriever:
         self.propagator = propagator or ActivationPropagator()
         self.reranker = reranker or LocalReranker()
         self.rewriter = rewriter or TextRewriter()
+        self.role_expander = RoleExpander()
         self._conn_provider = connections_provider
 
         # 如果 propagator 没有 connections_provider，把我们的设给它
@@ -102,6 +104,10 @@ class Retriever:
         """关联连接提供者"""
         self._conn_provider = provider
         self.propagator.attach(provider, type_checker=type_checker)
+
+    def attach_role_table(self, role_table):
+        """关联角色共现表"""
+        self.role_expander.attach(role_table)
 
     # ── 检索主入口 ───────────────────────────
 
@@ -197,6 +203,16 @@ class Retriever:
         if not candidate_spheres:
             return self._empty_result(query, timings, t0, mode)
 
+        # ── Step 5.5: 一级球体展开 ──
+        # FAISS 可能命中了一级球体（概念级），需要展开到它的二级子球体
+        for sphere in list(candidate_spheres):
+            if sphere.level == 1 and sphere.child_ids:
+                children = self.spheres.get_children(sphere.id)
+                for child in children:
+                    if child.id not in sphere_ids:
+                        sphere_ids.append(child.id)
+                        candidate_spheres.append(child)
+
         # ── Step 6: Activation Propagation ──
         use_act = cfg_activation.enabled if use_activation is None else use_activation
         propagation_stats = {}
@@ -238,6 +254,40 @@ class Retriever:
             timings["activation"] = time.time() - t_act
         else:
             timings["activation"] = 0
+
+        # ── Step 6.5: Role Expansion（角色共现跳转） ──
+        role_enabled = cfg_role.enabled and cfg_role.expand_after_faiss
+        if role_enabled:
+            t_role = time.time()
+            faiss_scores = {
+                sid: faiss_distances[i]
+                for i, sid in enumerate(sphere_ids[:len(faiss_distances)])
+                if i < len(faiss_distances)
+            }
+            role_candidates = self.role_expander.expand(
+                faiss_hit_ids=sphere_ids[:len(faiss_distances)],
+                faiss_hit_scores=faiss_scores,
+                max_expansions_per_hit=cfg_role.max_expansions_per_hit,
+                total_max_expansions=cfg_role.total_max_expansions,
+                min_confidence=cfg_role.min_confidence,
+                decay=cfg_role.decay_factor,
+                exclude_ids=set(sphere_ids),
+            )
+            if role_candidates:
+                new_role_ids = [sid for sid in role_candidates
+                                if sid not in sphere_ids]
+                if new_role_ids:
+                    new_spheres = self.spheres.get_many(new_role_ids)
+                    for ns in new_spheres:
+                        if ns:
+                            sphere_ids.append(ns.id)
+                            candidate_spheres.append(ns)
+                    logger.debug(
+                        f"Role expansion added {len(new_role_ids)} candidates"
+                    )
+            timings["role_expansion"] = time.time() - t_role
+        else:
+            timings["role_expansion"] = 0
 
         # ── Step 7: Gravity Focus ──
         t_gravity = time.time()

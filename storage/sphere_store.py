@@ -36,7 +36,7 @@ from config import paths as cfg_paths
 
 logger = logging.getLogger(__name__)
 
-SPHERE_VERSION = 1  # 用于未来迁移
+SPHERE_VERSION = 2  # 用于未来迁移（v2: 新增 level / parent_id / child_ids）
 
 
 # ──────────────────────────────────────────────
@@ -51,9 +51,15 @@ class Sphere:
                    格式: {"技术笔记": 0.85, "小说创作": 0.32}
                    值域 [0, 1]，越高表示该球体越接近该场域质心。
                    首次入库时预计算，质心变化时增量/全量更新。
+
+    ---- v2 新增层级字段 ----
+    level: 1=主语球体（概念级）, 2=句子球体（证据级）, 3=子概念球体
+    parent_id: 二级球体指向所属的一级球体
+    child_ids: 一级球体跟踪下属的二级球体
+    embedding_source: "subject"（一级=主语原文）| "sentence"（二级=完整句子）
     """
     id: str                          # 唯一标识（SHA256[:12]）
-    text: str                        # 原文片段
+    text: str                        # 球体原文
     source_file: str                 # 源文件名
     source_type: str = ""            # 场域标签
     mass: float = 1.0                # 基础质量
@@ -65,6 +71,11 @@ class Sphere:
     cluster_id: int = -1             # 所属簇 ID（-1=未分配，聚类后更新）
     active: bool = True              # 软删除标记
     created_at: str = ""             # 入库时间（ISO 格式）
+    # ---- v2 层级字段 ----
+    level: int = 2                   # 默认二级（向后兼容）
+    parent_id: str = ""              # 上级球体 ID（二级→一级）
+    child_ids: List[str] = field(default_factory=list)  # 下级球体 ID 列表
+    embedding_source: str = "sentence"
 
     def __post_init__(self):
         # 确保 effective_mass 与 mass+diversity 一致
@@ -151,6 +162,30 @@ class SphereStore:
             s for s in self._spheres.values()
             if s.source_type == source_type and s.active
         ]
+
+    def get_by_level(self, level: int) -> List[Sphere]:
+        """按层级查找（1=主语, 2=句子, 3=子概念）"""
+        return [
+            s for s in self._spheres.values()
+            if s.level == level and s.active
+        ]
+
+    def get_children(self, parent_id: str) -> List[Sphere]:
+        """获取一级球体的所有二级子球体"""
+        parent = self._spheres.get(parent_id)
+        if not parent:
+            return []
+        return [
+            self._spheres[cid] for cid in parent.child_ids
+            if cid in self._spheres and self._spheres[cid].active
+        ]
+
+    def get_parent(self, child_id: str) -> Optional[Sphere]:
+        """获取二级球体的上级主语球体"""
+        child = self._spheres.get(child_id)
+        if not child or not child.parent_id:
+            return None
+        return self._spheres.get(child.parent_id)
 
     def ids(self) -> List[str]:
         """返回所有活跃球体 ID（按添加顺序）"""
@@ -286,6 +321,10 @@ class SphereStore:
             "cluster_id": sphere.cluster_id,
             "active": sphere.active,
             "created_at": sphere.created_at,
+            "level": sphere.level,
+            "parent_id": sphere.parent_id,
+            "child_ids": sphere.child_ids,
+            "embedding_source": sphere.embedding_source,
         }
 
     @staticmethod
@@ -304,6 +343,10 @@ class SphereStore:
             cluster_id=d.get("cluster_id", -1),
             active=d.get("active", True),
             created_at=d.get("created_at", ""),
+            level=d.get("level", 2),
+            parent_id=d.get("parent_id", ""),
+            child_ids=d.get("child_ids", []),
+            embedding_source=d.get("embedding_source", "sentence"),
         )
 
 
@@ -312,12 +355,22 @@ class SphereStore:
 # ──────────────────────────────────────────────
 
 def make_sphere_id(text: str, source_file: str = "") -> str:
-    """从文本内容生成确定的球体 ID
+    """从文本内容生成球体 ID
 
-    使用 SHA256 的前 12 位十六进制字符（48 bits），
-    冲突概率在千亿级别，足够个人知识库使用。
-
-    同一文本 + 同一源文件 = 同一 ID → 幂等导入。
+    二级球体：相同文本 + 相同源文件 = 同一 ID（幂等导入）
+    一级球体：使用 make_concept_id（跨源文件一致）
     """
     raw = f"{source_file}:{text}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def make_concept_id(concept_text: str) -> str:
+    """从概念文本生成一级球体 ID
+
+    不依赖源文件路径，同一概念在不同文档出现时指向同一个 ID。
+    前缀添加 "c_" 以与二级球体 ID 区分（便于检索时识别层级）。
+    """
+    raw = f"concept:{concept_text.strip().lower()}"
+    # 使用 MD5[:8] 生成较短的概念 ID
+    import hashlib as hl
+    return "c_" + hl.md5(raw.encode("utf-8")).hexdigest()[:8]

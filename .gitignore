@@ -14,6 +14,7 @@ data/clusters/
 data/connections/
 data/gravity_lab/
 data/raw_arxiv/
+data.bak/
 data_backup_*/
 
 # Runtime

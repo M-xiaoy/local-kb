@@ -35,6 +35,8 @@ from pipeline.embedder import Embedder
 from pipeline.keywords import extract_keywords
 from pipeline.rewriter import TextRewriter
 from pipeline.connections import ConnectionDetector
+from pipeline.role_table import RoleTable
+from pipeline.hierarchy import HierarchyGrower, LevelingConfig
 from storage.faiss_store import FaissStore
 from storage.registry import Registry
 from storage.sphere_store import SphereStore, Sphere, make_sphere_id
@@ -803,6 +805,13 @@ class AppState:
         self.rewriter = TextRewriter()
         self.calibrator = SphereCalibrator()
         self.conn_detector = None  # 启动时按需创建
+        self.role_table = RoleTable()
+        self.hierarchy = HierarchyGrower(
+            sphere_store=self.sphere_store,
+            role_table=self.role_table,
+            vector_provider=self._get_vector_cache,
+            config=LevelingConfig(),
+        )
         self.retriever = Retriever(
             embedder=self.embedder,
             faiss_store=self.faiss_store,
@@ -812,6 +821,7 @@ class AppState:
             diversity_sorter=self.sorter,
             rewriter=self.rewriter,
         )
+        self.retriever.attach_role_table(self.role_table)
         self.uploads_dir = Path(cfg_paths.uploads_dir)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.wal = WalManager(str(Path(cfg_paths.wal_dir)))
@@ -832,6 +842,62 @@ class AppState:
                 type_checker=self.conn_detector.get_connection_type,
             )
             self.calibrator.attach(self.sphere_store, self.faiss_store._vectors)
+
+    def ensure_role_table(self):
+        """按需加载角色共现表"""
+        if self.role_table.entity_count == 0:
+            self.role_table.load()
+            if self.role_table.entity_count == 0 and self.sphere_store.count > 0:
+                # 首次构建
+                self.role_table.build_for_spheres(
+                    self.sphere_store.get_active()
+                )
+                self.role_table.save()
+                logger.info(
+                    f"Built role table from {self.sphere_store.count} spheres: "
+                    f"{self.role_table.entity_count} entities"
+                )
+
+    def _get_vector_cache(self, sphere_id: str):
+        """向量缓存查询（给 hierarchy grower 用）"""
+        fid = self.registry.faiss_id(sphere_id)
+        if fid is not None and fid in self.faiss_store._vectors:
+            return self.faiss_store._vectors[fid]
+        return None
+
+    def build_hierarchy(self):
+        """全量构建层级：grow → embed → FAISS add → save"""
+        stats = self.hierarchy.grow()
+
+        if stats.get("level1", 0) > 0:
+            # 计算概念向量并写入 FAISS
+            concepts = self.hierarchy.embed_concepts()
+            if concepts:
+                cids = []
+                cvecs = []
+                for cid, vec in concepts:
+                    cids.append(cid)
+                    cvecs.append(vec)
+
+                vectors_arr = np.stack(cvecs, axis=0)
+                ids_arr = np.empty(len(cids), dtype=np.int64)
+                self.faiss_store.add(vectors_arr, ids_arr)
+
+                # 注册概念球体到 registry
+                for i, cid in enumerate(cids):
+                    self.registry.register(cid, int(ids_arr[i]))
+
+                logger.info(
+                    f"Hierarchy: {len(concepts)} concepts added to FAISS"
+                )
+
+        # 持久化
+        self.sphere_store.save()
+        self.faiss_store.save()
+        self.registry.save()
+
+        logger.info(f"Hierarchy build complete: {stats}")
+        return stats
 
     def is_loaded(self) -> bool:
         return self.faiss_store.is_built
@@ -904,6 +970,7 @@ class StatusResponse(BaseModel):
     faiss_vectors: int
     fields: List[str]
     field_counts: dict
+    hierarchy: dict = {}
 
 
 # ──────────────────────────────────────────────
@@ -1054,6 +1121,15 @@ async def startup():
         # WAL 清理：删除 7 天前的已完成/已回滚条目
         state.wal.clean_old_entries(max_age_hours=24 * 7)
 
+        # ── 构建层级（社区检测→等级划分） ──
+        if sphere_count >= 5:
+            try:
+                state.ensure_role_table()
+                stats = state.build_hierarchy()
+                logger.info(f"Hierarchy built on startup: {stats}")
+            except Exception as e:
+                logger.warning(f"Hierarchy build on startup failed: {e}")
+
         if faiss_count > 0 and sphere_count > 0:
             logger.info("Knowledge base loaded successfully")
         else:
@@ -1083,12 +1159,14 @@ async def get_status():
     total = state.sphere_store.total_count
     fields = state.field_detector.fields
     field_counts = {f: state.field_detector._field_counts.get(f, 0) for f in fields}
+    hierarchy = state.hierarchy.stats() if hasattr(state, 'hierarchy') else {}
     return StatusResponse(
         total_spheres=total,
         active_spheres=active,
         faiss_vectors=state.faiss_store.count,
         fields=fields,
         field_counts=field_counts,
+        hierarchy=hierarchy,
     )
 
 
@@ -1338,6 +1416,18 @@ async def upload_file(
             except Exception as e:
                 logger.warning(f"Post-upload clustering failed (non-critical): {e}")
     timings["clustering"] = time.time() - t8
+
+    # ── 10. 角色共现表增量更新 ───────────────
+    t9 = time.time()
+    if new_spheres > 0 and auto_rebuild:
+        for sphere_id in added_sphere_ids:
+            sphere = state.sphere_store.get(sphere_id)
+            if sphere and sphere.text:
+                state.role_table.register_text(sphere.id, sphere.text)
+        state.role_table.save()
+        logger.debug(f"Role table: +{new_spheres} spheres, "
+                     f"{state.role_table.entity_count} total entities")
+    timings["role_table"] = time.time() - t9
 
     timings["total"] = time.time() - t0
 
@@ -1589,6 +1679,14 @@ async def rebuild():
         state.registry.save()
         state.faiss_store.save()
 
+        # 重建层级
+        try:
+            state.ensure_role_table()
+            stats = state.build_hierarchy()
+            logger.info(f"Hierarchy rebuilt: {stats}")
+        except Exception as e:
+            logger.warning(f"Hierarchy rebuild failed: {e}")
+
         return {
             "status": "ok",
             "rebuilt": len(active_spheres),
@@ -1663,6 +1761,17 @@ async def api_rebuild_axon():
 # ──────────────────────────────────────────────
 # 端点：校准 mass/diversity
 # ──────────────────────────────────────────────
+
+@app.post("/rebuild-hierarchy")
+async def api_rebuild_hierarchy():
+    """重建层级结构（社区检测→等级划分）"""
+    try:
+        state.ensure_role_table()
+        stats = state.build_hierarchy()
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Hierarchy rebuild failed: {e}")
+
 
 @app.post("/calibrate")
 async def api_calibrate():

@@ -209,6 +209,22 @@ class RerankerConfig:
 
 
 # ──────────────────────────────────────────────
+# 角色共现表配置（Phase 0.5 新增）
+# ──────────────────────────────────────────────
+@dataclass
+class RoleConfig:
+    """角色共现表 + 检索时扩展参数"""
+    enabled: bool = True
+    min_entity_length: int = 2          # 实体最短字数
+    max_entity_length: int = 60         # 实体最长字数
+    min_confidence: float = 0.3         # 跳转最低置信度
+    decay_factor: float = 0.6           # 扩展得分衰减系数
+    max_expansions_per_hit: int = 3     # 每命中最大扩展数
+    total_max_expansions: int = 20      # 总扩展上限
+    expand_after_faiss: bool = True     # 检索时是否启用角色扩展
+
+
+# ──────────────────────────────────────────────
 # 球体质量校准配置（Phase 0.2 新增）
 # ──────────────────────────────────────────────
 @dataclass
@@ -235,6 +251,8 @@ AVAILABLE_FIELDS: List[str] = [
 # ──────────────────────────────────────────────
 # 全局单例
 # ──────────────────────────────────────────────
+role = RoleConfig()
+
 paths = Paths()
 ollama = OllamaConfig()
 chunker = ChunkerConfig()
