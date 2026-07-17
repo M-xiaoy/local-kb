@@ -1206,6 +1206,21 @@ async def upload_file(
         raise HTTPException(status_code=422, detail=f"Parse failed: {e}")
     timings["parse"] = time.time() - t1
 
+    # 2.5 文档级关键术语抽取（在切片之前，保证覆盖面）
+    t_doc = time.time()
+    from pipeline.attr_head_extractor import AttrHeadExtractor
+    _doc_terms = AttrHeadExtractor().extract(result.text)
+    # 去重，取完整短语作为文档级术语
+    doc_term_texts = list(dict.fromkeys(
+        p.full_phrase for p in _doc_terms if p.has_attributive
+    ))
+    # 如果没有 AH 短语，fallback 到文档开头的前 3 个句子
+    if not doc_term_texts:
+        sentences = [s.strip() for s in result.text[:500].split("。") if len(s.strip()) > 5]
+        doc_term_texts = sentences[:3]
+    timings["doc_terms"] = time.time() - t_doc
+    logger.info(f"  doc_terms: {len(doc_term_texts)} terms extracted")
+
     # 3. 切片
     t2 = time.time()
     if result.file_type == "md":
@@ -1300,6 +1315,7 @@ async def upload_file(
             mass=1.0,
             gravity_field=gravity_field,
             term_weights=term_weights,
+            doc_terms=doc_term_texts,
             created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         if state.sphere_store.add(sphere):

@@ -401,7 +401,7 @@ class HierarchyGrower:
             entities = self._table._sphere_entities.get(sid, set())
             for eid in entities:
                 info = self._table._entities.get(eid)
-                if info and sid in info.as_subject:
+                if info and sid in info.as_phrase:
                     subject_counts[info.text] += 1
 
         # 返回所有非零主语（阈值筛选在 _filter_concepts_for_community 中按社区大小独立处理）

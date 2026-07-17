@@ -36,7 +36,7 @@ from config import paths as cfg_paths
 
 logger = logging.getLogger(__name__)
 
-SPHERE_VERSION = 2  # 用于未来迁移（v2: 新增 level / parent_id / child_ids）
+SPHERE_VERSION = 3  # v3: 新增 doc_terms 文档级关键术语
 
 
 # ──────────────────────────────────────────────
@@ -76,6 +76,8 @@ class Sphere:
     parent_id: str = ""              # 上级球体 ID（二级→一级）
     child_ids: List[str] = field(default_factory=list)  # 下级球体 ID 列表
     embedding_source: str = "sentence"
+    # ---- v3 文档级术语 ----
+    doc_terms: List[str] = field(default_factory=list)  # 文档级关键 AH 短语
 
     def __post_init__(self):
         # 确保 effective_mass 与 mass+diversity 一致
@@ -325,6 +327,7 @@ class SphereStore:
             "parent_id": sphere.parent_id,
             "child_ids": sphere.child_ids,
             "embedding_source": sphere.embedding_source,
+            "doc_terms": sphere.doc_terms,
         }
 
     @staticmethod
@@ -347,6 +350,7 @@ class SphereStore:
             parent_id=d.get("parent_id", ""),
             child_ids=d.get("child_ids", []),
             embedding_source=d.get("embedding_source", "sentence"),
+            doc_terms=d.get("doc_terms", []),
         )
 
 

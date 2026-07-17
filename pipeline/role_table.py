@@ -1,24 +1,24 @@
 """
-role_table.py — 角色共现表（主语-宾语结构）
-============================================
-核心数据结构，记录每个实体在哪些句子中充当主语、哪些充当宾语。
+role_table.py — 定中短语角色共现表
+===================================
+核心数据结构，记录每个定中短语实体在哪些球体中充当
+完整短语（phrase）、中心语（head）、定语（attributive）。
 
-检索时使用：命中句子 → 查其宾语实体 → 找到该实体做主语的句子 → 扩展候选池
-实现因果链的「结构性连接」——不需要依赖文本相似度或LLM推理。
+检索时使用：命中球体 → 查其短语/中心语实体 →
+找到共享相同短语/中心语/定语的其他球体 → 扩展候选池
 
-存储架构：
-  role_table.json          ← 实体注册表 + 角色共现记录
-  role_vectors.npz         ← 实体的embedding向量（选填，多级检索用）
+三种桥接强度：
+  shared_phrase:       完整 AH 短语跨球体出现（最强）
+  shared_head:         相同裸名词作为中心语（中等）
+  shared_attributive:  相同定语修饰不同名词（较弱）
 
 使用方式：
   table = RoleTable()
-  table.add_occurrence("冰川融化", "subject", "sphere_abc123")
-  table.add_occurrence("海平面上升", "object", "sphere_abc123")
-  table.add_occurrence("海平面上升", "subject", "sphere_def456")
+  table.register_text("sphere_abc", "基于深度学习的跨模态图像分割方法")
+  # → 注册 phrase="跨模态图像分割方法", head="方法", attr="跨模态", ...
   
-  # 检索扩展
-  jumps = table.expand_from_sphere("sphere_abc123")
-  # → [("sphere_def456", "role_bridge", 0.7), ...]
+  jumps = table.expand_from_sphere("sphere_abc")
+  # → [("sphere_def", "shared_phrase", 0.85), ...]
 """
 
 import json
@@ -43,21 +43,19 @@ ROLE_TABLE_VERSION = 1
 
 @dataclass
 class EntityInfo:
-    """一个实体在所有句子中的角色分布"""
-    text: str                        # 实体原文（如"冰川融化"）
+    """一个定中短语实体在所有句子中的角色分布"""
+    text: str                        # 实体原文（完整 AH 短语，如"跨模态图像分割方法"）
     occurrences: int = 0             # 总出现次数
-    as_subject: List[str] = field(default_factory=list)   # 做主语时的句子 sphere_id
-    as_object: List[str] = field(default_factory=list)    # 做宾语时的句子 sphere_id
-    subject_count: int = 0
-    object_count: int = 0
-    # 与其他实体的共现记录（可选扩展）
-    # 格式: {other_entity_id: 共现次数}
+    as_phrase: List[str] = field(default_factory=list)     # 作为完整定中短语出现的球体
+    as_head: List[str] = field(default_factory=list)       # 作为中心语裸名词出现的球体
+    as_attributive: List[str] = field(default_factory=list) # 作为定语部分出现的球体
+    # 与其他实体的共现记录
     co_occurrences: Dict[str, int] = field(default_factory=dict)
 
     @property
     def is_active(self) -> bool:
-        """实体是否有足够出现次数，值得作为跳转节点"""
-        return self.occurrences >= 2  # ≥2 次才可能同时做主语和宾语
+        """出现≥2次即可作为跳转节点"""
+        return self.occurrences >= 2
 
 
 # ──────────────────────────────────────────────
@@ -66,9 +64,9 @@ class EntityInfo:
 
 @dataclass
 class JumpCandidate:
-    target_sphere_id: str            # 目标句子球体 ID
-    bridge_entity: str               # 桥接实体（如"海平面上升"）
-    bridge_type: str                 # "subject→object" | "object→subject"
+    target_sphere_id: str            # 目标球体 ID
+    bridge_entity: str               # 桥接实体（完整 AH 短语或中心语）
+    bridge_type: str                 # "shared_phrase" | "shared_head" | "shared_attributive"
     confidence: float                # 跳转置信度 [0, 1]
 
 
@@ -386,7 +384,8 @@ class RoleTable:
         self._text_to_id: Dict[str, str] = {}          # entity_text → entity_id
         self._sphere_entities: Dict[str, Set[str]] = {}  # sphere_id → {entity_id, ...}
         self._dirty = False
-        self._extractor = SubjectExtractor()
+        from pipeline.attr_head_extractor import AttrHeadExtractor
+        self._extractor = AttrHeadExtractor()
 
     # ── 属性 ──────────────────────────────────
 
@@ -408,65 +407,70 @@ class RoleTable:
     # ── 入库接口 ─────────────────────────────
 
     def register_text(self, sphere_id: str, text: str) -> int:
-        """注册一个句子球体的主谓宾信息
+        """注册一个球体的定中短语信息
 
-        自动提取三元组，更新角色共现表。
+        自动提取 AH 短语，更新角色表。
 
         Args:
-            sphere_id: 句子球体 ID（二级ID）
-            text: 句子原文
+            sphere_id: 球体 ID
+            text: 球体原文
 
         Returns:
             注册的实体数
         """
-        triples = self._extractor.extract(text)
+        pairs = self._extractor.extract(text)
         count = 0
 
-        for triple in triples:
-            subject = triple.get("subject", "")
-            obj = triple.get("object", "")
-
-            if subject and len(subject) >= 2:
-                self._add_role(subject, "subject", sphere_id)
+        for p in pairs:
+            # 完整定中短语作为实体
+            phrase = p.full_phrase
+            if len(phrase) >= 3:
+                self._add_role(phrase, "phrase", sphere_id)
                 count += 1
 
-            if obj and len(obj) >= 2:
-                self._add_role(obj, "object", sphere_id)
+            # 中心语单独注册（用作共享中心语桥接）
+            head = p.head
+            if head and len(head) >= 2:
+                self._add_role(head, "head", sphere_id)
                 count += 1
+
+            # 定语也注册（太短的忽略）
+            for attr in p.attributives:
+                if len(attr) >= 3:
+                    self._add_role(attr, "attributive", sphere_id)
+                    count += 1
 
         return count
 
     def _add_role(self, entity_text: str, role: str, sphere_id: str):
-        """注册一个实体在某个句子中的角色"""
+        """注册一个 AH 实体在某个球体中的角色"""
         entity_id = self._make_entity_id(entity_text)
 
-        # 获取或创建实体
         if entity_id not in self._entities:
             self._entities[entity_id] = EntityInfo(text=entity_text[:60])
             self._text_to_id[entity_text] = entity_id
 
         info = self._entities[entity_id]
 
-        # 记录角色
-        if role == "subject":
-            if sphere_id not in info.as_subject:
-                info.as_subject.append(sphere_id)
-                info.subject_count += 1
-        elif role == "object":
-            if sphere_id not in info.as_object:
-                info.as_object.append(sphere_id)
-                info.object_count += 1
+        if role == "phrase":
+            if sphere_id not in info.as_phrase:
+                info.as_phrase.append(sphere_id)
+        elif role == "head":
+            if sphere_id not in info.as_head:
+                info.as_head.append(sphere_id)
+        elif role == "attributive":
+            if sphere_id not in info.as_attributive:
+                info.as_attributive.append(sphere_id)
+        else:
+            return  # 未知角色，跳过
 
         info.occurrences += 1
 
-        # 记录句子→实体映射（用于反向查询）
         if sphere_id not in self._sphere_entities:
             self._sphere_entities[sphere_id] = set()
         self._sphere_entities[sphere_id].add(entity_id)
 
-        # 记录共现：当前句子的其他实体
         self._update_co_occurrences(sphere_id, entity_id)
-
         self._dirty = True
 
     # ── 检索扩展 ─────────────────────────────
@@ -477,15 +481,15 @@ class RoleTable:
         max_candidates: int = 10,
         min_confidence: float = 0.3,
     ) -> List[JumpCandidate]:
-        """从一个句子球体出发，通过角色模式扩展出相关候选
+        """从球体出发，通过定中短语角色模式扩展候选
 
-        扩展逻辑：
-          1. 找到本句子中的所有宾语实体
-          2. 对每个宾语实体，找到它做主语的其他句子
-          3. 同一个实体在句A做宾语、在句B做主语 → A→B 是因果/推理链
+        三级扩展（按强度降序）：
+          1. shared_phrase:       完整 AH 短语跨球体出现
+          2. shared_head:         相同中心语出现在不同短语中
+          3. shared_attributive:  相同定语出现在不同短语中
 
         Args:
-            sphere_id: 出发句子的球体 ID
+            sphere_id: 出发球体 ID
             max_candidates: 最大扩展数量
             min_confidence: 最低置信度
 
@@ -503,12 +507,18 @@ class RoleTable:
             if not info or not info.is_active:
                 continue
 
-            # ★ 核心：实体在本句作宾语 → 在目标句作主语
-            if sphere_id in info.as_object:
-                for target_id in info.as_subject:
+            # 三级：短语 / 中心语 / 定语
+            for bridge_type, target_list, base_conf in [
+                ("shared_phrase", info.as_phrase, 1.0),
+                ("shared_head", info.as_head, 0.6),
+                ("shared_attributive", info.as_attributive, 0.4),
+            ]:
+                if sphere_id not in target_list:
+                    continue
+                for target_id in target_list:
                     if target_id == sphere_id:
                         continue
-                    confidence = self._jump_confidence(
+                    confidence = base_conf * self._jump_confidence(
                         sphere_id, target_id, eid, info
                     )
                     if confidence < min_confidence:
@@ -516,31 +526,10 @@ class RoleTable:
                     jc = JumpCandidate(
                         target_sphere_id=target_id,
                         bridge_entity=info.text,
-                        bridge_type="object→subject",
+                        bridge_type=bridge_type,
                         confidence=confidence,
                     )
-                    # 同一目标，保留最高置信度
-                    key = (target_id, eid)
-                    if key not in candidates or confidence > candidates[key].confidence:
-                        candidates[key] = jc
-
-            # 反向：实体在本句作主语 → 在目标句作宾语（可逆的推理链）
-            if sphere_id in info.as_subject:
-                for target_id in info.as_object:
-                    if target_id == sphere_id:
-                        continue
-                    confidence = self._jump_confidence(
-                        sphere_id, target_id, eid, info, reverse=True
-                    )
-                    if confidence < min_confidence:
-                        continue
-                    jc = JumpCandidate(
-                        target_sphere_id=target_id,
-                        bridge_entity=info.text,
-                        bridge_type="subject→object",
-                        confidence=confidence,
-                    )
-                    key = (target_id, eid)
+                    key = (target_id, eid, bridge_type)
                     if key not in candidates or confidence > candidates[key].confidence:
                         candidates[key] = jc
 
@@ -553,11 +542,7 @@ class RoleTable:
         entity_texts: List[str],
         max_candidates: int = 10,
     ) -> List[JumpCandidate]:
-        """从实体集合出发，找到穿针引线的相关句子
-
-        不限于主语-宾语模式，任何包含这些实体的句子都算。
-        适用于查询关键词已知时的快速扩展。
-        """
+        """从实体集合出发，找到穿针引线的相关球体"""
         candidates: Dict[str, JumpCandidate] = {}
 
         for et in entity_texts:
@@ -568,8 +553,7 @@ class RoleTable:
             if not info:
                 continue
 
-            # 所有包含该实体的句子
-            all_sentences = set(info.as_subject) | set(info.as_object)
+            all_sentences = set(info.as_phrase) | set(info.as_head) | set(info.as_attributive)
             for sid in all_sentences:
                 if sid not in candidates:
                     candidates[sid] = JumpCandidate(
@@ -599,10 +583,7 @@ class RoleTable:
         ]
 
     def get_role_distribution(self, entity_text: str) -> Optional[Dict]:
-        """获取一个实体的角色分布
-        
-        用于分析：某实体是偏主语型（主动）还是偏宾语型（被动）
-        """
+        """获取一个实体的定中角色分布"""
         eid = self._text_to_id.get(entity_text)
         if not eid or eid not in self._entities:
             return None
@@ -610,9 +591,9 @@ class RoleTable:
         return {
             "text": info.text,
             "occurrences": info.occurrences,
-            "as_subject_count": info.subject_count,
-            "as_object_count": info.object_count,
-            "subject_ratio": info.subject_count / max(info.occurrences, 1),
+            "as_phrase_count": len(info.as_phrase),
+            "as_head_count": len(info.as_head),
+            "as_attributive_count": len(info.as_attributive),
         }
 
     # ── 共现分析 ─────────────────────────────
@@ -630,42 +611,35 @@ class RoleTable:
     # ── 置信度计算 ───────────────────────────
 
     @staticmethod
+    @staticmethod
     def _jump_confidence(
         source_id: str,
         target_id: str,
         bridge_eid: str,
         bridge_info: EntityInfo,
-        reverse: bool = False,
     ) -> float:
         """计算跳转置信度
 
         考虑因素：
           1. 桥接实体出现次数：≥3次 → 高置信
-          2. 角色分布均衡度：偏科太严重（总做主语不做宾语）→ 置信略低
-          3. 桥接质量：同一实体做的角色转换是强信号
+          2. 短语/中心语/定语角色覆盖面：越全面置信越高
 
         Returns:
             confidence ∈ [0.3, 0.95]
         """
         base = 0.5
 
-        # 出现次数加分
         if bridge_info.occurrences >= 5:
             base += 0.2
         elif bridge_info.occurrences >= 3:
             base += 0.1
 
-        # 角色均衡度加分
-        total = bridge_info.subject_count + bridge_info.object_count
-        if total >= 2:
-            subject_ratio = bridge_info.subject_count / total
-            # 越接近 0.5 越均衡（既能做主又能做宾 → 更好的桥接）
-            balance = 1 - 2 * abs(subject_ratio - 0.5)
-            base += 0.15 * balance
-
-        # 反转时降 0.05（主语→宾语模式不如宾语→主语模式强）
-        if reverse:
-            base -= 0.05
+        # 角色覆盖面：同时出现为短语+中心语+定语 → 高置信
+        roles = 0
+        for lst in (bridge_info.as_phrase, bridge_info.as_head, bridge_info.as_attributive):
+            if len(lst) > 0:
+                roles += 1
+        base += 0.08 * roles
 
         return min(0.95, max(0.3, base))
 
@@ -681,10 +655,9 @@ class RoleTable:
                 eid: {
                     "text": info.text,
                     "occurrences": info.occurrences,
-                    "as_subject": info.as_subject,
-                    "as_object": info.as_object,
-                    "subject_count": info.subject_count,
-                    "object_count": info.object_count,
+                    "as_phrase": info.as_phrase,
+                    "as_head": info.as_head,
+                    "as_attributive": info.as_attributive,
                     "co_occurrences": info.co_occurrences,
                 }
                 for eid, info in self._entities.items()
@@ -727,10 +700,9 @@ class RoleTable:
             info = EntityInfo(
                 text=edata["text"],
                 occurrences=edata.get("occurrences", 0),
-                as_subject=edata.get("as_subject", []),
-                as_object=edata.get("as_object", []),
-                subject_count=edata.get("subject_count", 0),
-                object_count=edata.get("object_count", 0),
+                as_phrase=edata.get("as_phrase", []),
+                as_head=edata.get("as_head", []),
+                as_attributive=edata.get("as_attributive", []),
                 co_occurrences=edata.get("co_occurrences", {}),
             )
             self._entities[eid] = info
