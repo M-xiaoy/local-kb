@@ -918,7 +918,7 @@ class QueryRequest(BaseModel):
     field_focus: Optional[str] = None    # 聚焦某场域（null=不聚焦）
     reset_focus: bool = False            # 退出聚焦
     exclude_ids: Optional[List[str]] = None  # 排除已返回的球体
-    mode: str = "gravity"               # simple | gravity | deep
+    mode: str = "poincare"              # simple | gravity | deep | poincare
     use_activation: Optional[bool] = None # 覆盖激活传播开关
     use_reranker: Optional[bool] = None   # 覆盖重排器开关
     max_hops: int = 2                     # 激活传播跳数
@@ -1159,7 +1159,10 @@ async def get_status():
     total = state.sphere_store.total_count
     fields = state.field_detector.fields
     field_counts = {f: state.field_detector._field_counts.get(f, 0) for f in fields}
-    hierarchy = state.hierarchy.stats() if hasattr(state, 'hierarchy') else {}
+    try:
+        hierarchy = state.hierarchy.stats() if hasattr(state, 'hierarchy') else {}
+    except (AttributeError, Exception):
+        hierarchy = {}
     return StatusResponse(
         total_spheres=total,
         active_spheres=active,
@@ -1506,8 +1509,8 @@ async def query(request: QueryRequest):
     if session:
         exclude |= session.exclude_ids
 
-    # 确保连接层已初始化（如果是 gravity/deep 模式）
-    if request.mode in ("gravity", "deep"):
+    # 确保连接层已初始化（如果是 gravity/deep/poincare 模式）
+    if request.mode in ("gravity", "deep", "poincare"):
         state.ensure_connections()
 
     result: RetrievalResult = state.retriever.retrieve(
@@ -1574,7 +1577,7 @@ async def ask(request: AskRequest):
         query=request.query,
         top_k=request.top_k,
         field_focus=request.field_focus,
-        mode="gravity",
+        mode="poincare",
         use_reranker=False,
     )
 

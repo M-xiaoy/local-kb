@@ -280,6 +280,35 @@ class FaissStore:
 
     # ── 内部方法 ─────────────────────────────
 
+    # ── Poincaré Ball 导出 ────────────────────
+    #
+    # 双曲搜索（PoincaréSearch）需要访问全量向量缓存。
+    # FaissStore 维护 _vectors，通过以下方法安全暴露。
+
+    def get_all_vectors(self) -> Dict[int, np.ndarray]:
+        """获取 _vectors 缓存的只读副本
+
+        Returns:
+            {faiss_id: vector} 的所有向量
+        """
+        return dict(self._vectors)
+
+    def get_vector_matrix(self) -> Tuple[np.ndarray, np.ndarray]:
+        """获取向量矩阵和对应的 ID 数组
+
+        Returns:
+            (ids, vectors):
+              ids:     (n,) int64
+              vectors: (n, dim) float32
+        """
+        if not self._vectors:
+            return np.array([], dtype=np.int64), np.zeros((0, self.dim), dtype=np.float32)
+        ids = np.array(list(self._vectors.keys()), dtype=np.int64)
+        vecs = np.stack(list(self._vectors.values()), axis=0)
+        return ids, vecs
+
+    # ── 内部方法 ─────────────────────────────
+
     def _validate_inputs(self, vectors: np.ndarray, ids: np.ndarray):
         """校验输入向量的维度和类型"""
         if vectors.shape[0] != ids.shape[0]:

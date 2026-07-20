@@ -36,7 +36,7 @@ from config import paths as cfg_paths
 
 logger = logging.getLogger(__name__)
 
-SPHERE_VERSION = 3  # v3: 新增 doc_terms 文档级关键术语
+SPHERE_VERSION = 4  # v4: 新增 poincare_norm 双曲空间范数
 
 
 # ──────────────────────────────────────────────
@@ -78,6 +78,9 @@ class Sphere:
     embedding_source: str = "sentence"
     # ---- v3 文档级术语 ----
     doc_terms: List[str] = field(default_factory=list)  # 文档级关键 AH 短语
+    # ---- v4 双曲空间 ----
+    poincare_norm: float = 0.5  # Poincaré Ball 范数 [0, 1)，覆盖率越高→越靠近球心
+    poincare_norm_source: str = "default"  # "default" | "community" | "explicit"
 
     def __post_init__(self):
         # 确保 effective_mass 与 mass+diversity 一致
@@ -328,6 +331,8 @@ class SphereStore:
             "child_ids": sphere.child_ids,
             "embedding_source": sphere.embedding_source,
             "doc_terms": sphere.doc_terms,
+            "poincare_norm": sphere.poincare_norm,
+            "poincare_norm_source": sphere.poincare_norm_source,
         }
 
     @staticmethod
@@ -351,6 +356,8 @@ class SphereStore:
             child_ids=d.get("child_ids", []),
             embedding_source=d.get("embedding_source", "sentence"),
             doc_terms=d.get("doc_terms", []),
+            poincare_norm=d.get("poincare_norm", 0.5),
+            poincare_norm_source=d.get("poincare_norm_source", "default"),
         )
 
 

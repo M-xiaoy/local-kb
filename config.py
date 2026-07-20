@@ -77,6 +77,18 @@ class RetrievalConfig:
 
 
 # ──────────────────────────────────────────────
+# Poincaré 双曲检索配置
+# ──────────────────────────────────────────────
+@dataclass
+class PoincareConfig:
+    enabled: bool = True
+    default_mode: str = "poincare"  # "poincare" | "gravity"
+    eps: float = 1e-5
+    # 双曲空间稳定性：控制向量压缩到 Poincaré Ball 的余量
+    ball_margin: float = 1e-5
+
+
+# ──────────────────────────────────────────────
 # Web 服务配置
 # ──────────────────────────────────────────────
 @dataclass
@@ -266,3 +278,6 @@ axon = AxonConfig()
 activation = ActivationConfig()
 reranker = RerankerConfig()
 calibrator = CalibratorConfig()
+
+# Poincaré 双曲检索
+poincare = PoincareConfig()

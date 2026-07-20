@@ -16,6 +16,11 @@ retriever.py — 重力检索编排器（v2）
      query → rewrite → embed → FAISS → activation → rerank
      → gravity_focus → diversity_sort → Top-5
 
+  poincare — 双曲空间 Poincaré Ball 检索
+     query → embed → PoincaréDistance → lookup → gravity_focus
+     → diversity_sort → Top-5
+     （不依赖 FAISS，纯 NumPy 双曲距离）
+
   explore — 探索模式（用于内部工具）
      不依赖 query，直接对 sphere_id 或 cluster_id 操作
 """
@@ -39,6 +44,7 @@ from retrieval.diversity_sorter import DiversitySorter
 from retrieval.activation import ActivationPropagator
 from retrieval.reranker import LocalReranker
 from retrieval.role_expander import RoleExpander
+from retrieval.poincare_search import PoincareSearch
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +88,7 @@ class Retriever:
     ):
         self.embedder = embedder or Embedder()
         self.faiss = faiss_store or FaissStore()
+        self.poincare = PoincareSearch()
         self.registry = registry or Registry()
         self.spheres = sphere_store or SphereStore()
         self.field_detector = field_detector or FieldDetector()
@@ -173,6 +180,16 @@ class Retriever:
         # === 简单模式：纯 FAISS 相似度 ===
         if mode == "simple":
             return self._retrieve_simple(
+                query, query_vector, fetch_k, top_k,
+                field_focus, exclude_ids, timings, t0
+            )
+
+        # === Poincaré 模式：双曲空间检索 ===
+        if mode == "poincare":
+            if not self.poincare.is_built:
+                # 从 FaissStore 的向量缓存构建（首次运行时自动同步）
+                self.poincare.build_from_store(self.faiss)
+            return self._retrieve_poincare(
                 query, query_vector, fetch_k, top_k,
                 field_focus, exclude_ids, timings, t0
             )
@@ -451,6 +468,161 @@ class Retriever:
             timing=timings,
             total_count=self.spheres.count,
             mode="simple",
+        )
+
+    # ── Poincaré 双曲检索模式 ─────────────────
+
+    def _retrieve_poincare(self, query, query_vector, fetch_k, top_k,
+                            field_focus, exclude_ids, timings, t0):
+        """Poincaré Ball 双曲空间检索
+
+        核心改进：方向来自 bge-m3 embedding，半径来自社区覆盖率/层次结构。
+        不再对所有向量做自动压缩，而是使用每个球体的 poincare_norm。
+
+        完整继承后续流水线：球体展开 → 重力聚焦 → 多样性排序 → 术语融合。
+        """
+        # ── 构建 faiss_id → poincare_norm 映射 ──
+        faiss_to_norm = {}
+        for sid, sphere in self.spheres._spheres.items():
+            if sphere.active:
+                fid = self.registry.faiss_id(sid)
+                if fid is not None:
+                    faiss_to_norm[fid] = sphere.poincare_norm
+
+        # ── Step 3: Poincaré 距离检索 ──
+        t_search = time.time()
+        query_norm = 0.5  # 查询保持中性抽象度
+        try:
+            if not self.poincare.is_built:
+                self.poincare.build_from_store(self.faiss)
+            faiss_ids, poincare_distances, poincare_vectors = self.poincare.search(
+                query_vector, top_k=fetch_k,
+                query_norm=query_norm,
+                faiss_to_norm=faiss_to_norm,
+            )
+        except RuntimeError as e:
+            logger.warning(f"Poincaré search failed, falling back to FAISS: {e}")
+            faiss_ids, poincare_distances, poincare_vectors = self.faiss.search(
+                query_vector, top_k=fetch_k
+            )
+        timings["poincare_search"] = time.time() - t_search
+
+        if len(faiss_ids) == 0:
+            return self._empty_result(query, timings, t0, "poincare")
+
+        # ── Step 4: Registry → sphere_ids ──
+        t_lookup = time.time()
+        valid_indices, sphere_ids, candidate_vectors = \
+            self._resolve_ids(faiss_ids, poincare_distances, poincare_vectors,
+                              field_focus, exclude_ids)
+        timings["lookup"] = time.time() - t_lookup
+
+        if not sphere_ids:
+            return self._empty_result(query, timings, t0, "poincare")
+
+        # ── Step 5: 查 Sphere 元数据 ──
+        candidate_spheres = self.spheres.get_many(sphere_ids)
+
+        if not candidate_spheres:
+            return self._empty_result(query, timings, t0, "poincare")
+
+        # ── Step 5.5: 一级球体展开 ──
+        for sphere in list(candidate_spheres):
+            if sphere.level == 1 and sphere.child_ids:
+                children = self.spheres.get_children(sphere.id)
+                for child in children:
+                    if child.id not in sphere_ids:
+                        sphere_ids.append(child.id)
+                        candidate_spheres.append(child)
+
+        # ── Step 7: Gravity Focus（双曲模式下跳过了 activation 和 rerank） ──
+        t_gravity = time.time()
+        multipliers = self.field_detector.gravity_focus(
+            query_vector, candidate_spheres, strength=0.2
+        )
+        timings["gravity_focus"] = time.time() - t_gravity
+
+        # ── Step 9: 多样性排序 ──
+        t_sort = time.time()
+
+        sort_ids = sphere_ids[:min(len(sphere_ids), fetch_k)]
+        sort_spheres = [s for s in candidate_spheres if s.id in sort_ids]
+        sort_spheres.sort(key=lambda s: sort_ids.index(s.id))
+
+        sort_vectors_list = []
+        for s in sort_spheres:
+            vec = self.faiss._vectors.get(
+                self.registry.faiss_id(s.id)
+            ) if self.registry and self.registry.faiss_id(s.id) else None
+            if vec is None:
+                vec = np.zeros(self.embedder.embed_dim, dtype=np.float32)
+            sort_vectors_list.append(vec)
+
+        if sort_vectors_list:
+            sort_vectors = np.stack(sort_vectors_list, axis=0)
+        else:
+            sort_vectors = np.zeros((0, self.embedder.embed_dim), dtype=np.float32)
+
+        sorted_results = self.sorter.sort(
+            query_vector=query_vector,
+            candidate_vectors=sort_vectors,
+            candidate_ids=[s.id for s in sort_spheres],
+            source_files=[s.source_file for s in sort_spheres],
+            source_types=[
+                f"簇{s.cluster_id}" if s.cluster_id >= 0 else s.source_type
+                for s in sort_spheres
+            ],
+            field_affinities=self.field_detector.detect(query_vector),
+            top_k=top_k,
+            connections_provider=self._conn_provider,
+        )
+        timings["diversity_sort"] = time.time() - t_sort
+
+        # ── Step 10: 术语引力融合 ──
+        t_term = time.time()
+        query_keywords = extract_from_query(query)
+        if query_keywords and sorted_results:
+            fused_results = []
+            for sphere_id, div_score in sorted_results:
+                sphere = self.spheres.get(sphere_id)
+                tw = sphere.term_weights if sphere else {}
+                term_score = match_term_gravity(query_keywords, tw)
+                fused = 0.7 * div_score + 0.3 * term_score
+                fused_results.append((sphere_id, fused))
+            fused_results.sort(key=lambda x: -x[1])
+            sorted_results = fused_results
+        timings["term_fusion"] = time.time() - t_term
+
+        # ── Step 11: Context Assembly ──
+        t_ctx = time.time()
+        assembled = []
+        for sphere_id, score in sorted_results:
+            sphere = self.spheres.get(sphere_id)
+            if not sphere:
+                continue
+            assembled.append((sphere_id, score))
+        timings["context_assembly"] = time.time() - t_ctx
+
+        # ── 组装结果 ──
+        final_spheres = []
+        final_scores = []
+        for sphere_id, score in assembled:
+            sphere = self.spheres.get(sphere_id)
+            if sphere:
+                final_spheres.append(sphere)
+                final_scores.append(score)
+
+        timings["total"] = time.time() - t0
+
+        return RetrievalResult(
+            query=query,
+            spheres=final_spheres[:top_k],
+            scores=final_scores[:top_k],
+            field_affinities=self.field_detector.detect(query_vector),
+            timing=timings,
+            total_count=self.spheres.count,
+            mode="poincare",
+            propagation_stats={},
         )
 
     # ── 辅助 ─────────────────────────────────
