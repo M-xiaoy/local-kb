@@ -172,116 +172,62 @@ class KnowledgeBase:
     # ── 查询 ──────────────────────────────────
 
     def query(self, query_text: str, top_k: int = 10,
-              mode: str = "poincare",
-              fetch_k: int = 100,
-              field_focus: Optional[str] = None,
+              fetch_k: int = 50,
               exclude_ids: Optional[List[str]] = None,
-              use_activation: Optional[bool] = None,
-              use_reranker: Optional[bool] = None,
-              max_hops: int = 2) -> SearchResult:
+              use_hyperbolic: bool = True) -> SearchResult:
         """统一查询入口
 
-        优先使用 retriever.retrieve()（完整检索管线），
-        降级到简化版（直接 FAISS + 评分）。
+        由 Retriever 执行 FAISS 初召 + (可选) Poincaré 重排。
+        无降级路径 —— 未初始化 retriever 时直接返回空结果。
 
         Args:
             query_text: 自然语言查询
             top_k: 返回结果数
-            mode: "poincare" | "gravity"
-            fetch_k: FAISS 粗搜候选池大小（retriever 模式用）
-            field_focus: 场域聚焦（retriever 模式用）
-            exclude_ids: 排除球体列表（retriever 模式用）
-            use_activation: 激活传播开关
-            use_reranker: 重排器开关
-            max_hops: 激活传播跳数
+            fetch_k: FAISS 粗搜候选池大小
+            exclude_ids: 排除球体列表
+            use_hyperbolic: True=Poincaré 重排, False=纯余弦排序
 
         Returns:
-            SearchResult（按得分降序，附带 poincare_norm）
+            SearchResult
         """
         t0 = time.time()
 
-        # ── 完整检索管线 ────────────────────
-        if self.retriever is not None:
-            try:
-                raw = self.retriever.retrieve(
-                    query=query_text,
-                    top_k=top_k,
-                    fetch_k=fetch_k,
-                    field_focus=field_focus,
-                    exclude_ids=exclude_ids or [],
-                    mode=mode,
-                    use_activation=use_activation,
-                    use_reranker=use_reranker,
-                    max_hops=max_hops,
-                )
-                # 映射为 SearchResult（统一格式）
-                sphere_ids = [s.id for s in raw.spheres]
-                scores = list(raw.scores)
-                # 附加 poincare_norm 和 field_affinities
-                elapsed = time.time() - t0
-                result = SearchResult(
-                    sphere_ids=sphere_ids,
-                    distances=[],
-                    scores=scores,
-                )
-                # 附加元数据（用于结构化日志）
-                top_norms = []
-                for sid in sphere_ids[:3]:
-                    n = self._repo.get_poincare_norm(sid)
-                    top_norms.append(f"{n:.3f}" if n else "?")
-                logger.info(
-                    f"kb.query [retriever]: query='{query_text[:40]}' "
-                    f"mode={mode} results={len(sphere_ids)} "
-                    f"top_scores={[round(s,4) for s in scores[:3]]} "
-                    f"top_norms=[{','.join(top_norms)}] "
-                    f"time={elapsed:.2f}s"
-                )
-                return result
-            except Exception as e:
-                logger.warning(f"kb.query retriever failed, falling back: {e}")
-                # fall through to simplified path
-
-        # ── 降级路径：简化版检索 ────────────
-        query_vec = self._embedder.embed_query(query_text)
-        query_vec = np.ascontiguousarray(query_vec.astype(np.float32))
-        if query_vec.ndim == 1:
-            query_vec = query_vec.reshape(1, -1)
-
-        # Poincaré 投影：查询向量也映射到双曲球
-        query_vec_poincare = poincare_project_query(query_vec.flatten())
-        query_vec_poincare = query_vec_poincare.reshape(1, -1)
-
-        raw = self._repo.search(query_vec_poincare, top_k=top_k * 3)
-        if not raw.sphere_ids:
+        if self.retriever is None:
+            logger.error("kb.query called but retriever is None")
             return SearchResult(sphere_ids=[], distances=[], scores=[])
 
-        if mode == "poincare":
-            scored = self._score_poincare(raw.sphere_ids, raw.distances, query_vec_poincare, raw.vectors)
-        else:
-            scored = self._score_gravity(raw.sphere_ids, raw.distances, query_vec_poincare)
+        try:
+            raw = self.retriever.retrieve(
+                query=query_text,
+                top_k=top_k,
+                fetch_k=fetch_k,
+                exclude_ids=exclude_ids or [],
+                use_hyperbolic=use_hyperbolic,
+            )
+            sphere_ids = [s.id for s in raw.spheres]
+            scores = list(raw.scores)
+            elapsed = time.time() - t0
 
-        scored.sort(key=lambda x: -x[1])
-        top = scored[:top_k]
-
-        result = SearchResult(
-            sphere_ids=[s[0] for s in top],
-            distances=[s[2] for s in top],
-            scores=[s[1] for s in top],
-        )
-
-        elapsed = time.time() - t0
-        top_norms = []
-        for sid in result.sphere_ids[:3]:
-            n = self._repo.get_poincare_norm(sid)
-            top_norms.append(f"{n:.3f}" if n else "?")
-        logger.info(
-            f"kb.query [fallback]: query='{query_text[:40]}' mode={mode} "
-            f"results={len(result.sphere_ids)} "
-            f"top_scores={[round(s,4) for s in result.scores[:3]]} "
-            f"top_norms=[{','.join(top_norms)}] "
-            f"time={elapsed:.2f}s"
-        )
-        return result
+            top_norms = []
+            for sid in sphere_ids[:3]:
+                n = self._repo.get_poincare_norm(sid)
+                top_norms.append(f"{n:.3f}" if n else "?")
+            mode_label = "hyperbolic" if use_hyperbolic else "cosine"
+            logger.info(
+                f"kb.query: query='{query_text[:40]}' "
+                f"mode={mode_label} results={len(sphere_ids)} "
+                f"top_scores={[round(s,4) for s in scores[:3]]} "
+                f"top_norms=[{','.join(top_norms)}] "
+                f"time={elapsed:.2f}s"
+            )
+            return SearchResult(
+                sphere_ids=sphere_ids,
+                distances=[],
+                scores=scores,
+            )
+        except Exception as e:
+            logger.error(f"kb.query failed: {e}")
+            return SearchResult(sphere_ids=[], distances=[], scores=[])
 
     # ── 评分策略 ─────────────────────────────
 

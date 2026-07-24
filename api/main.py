@@ -42,13 +42,11 @@ from storage.registry import Registry
 from storage.sphere_store import SphereStore, Sphere, make_sphere_id
 from storage.calibrator import SphereCalibrator
 from storage.wal import WalManager, WAL_READY, WAL_COMMITTING
-from retrieval.field_detector import FieldDetector
-from retrieval.diversity_sorter import DiversitySorter
 from retrieval.retriever import Retriever, RetrievalResult
-from retrieval.reranker import LocalReranker
-from retrieval.activation import ActivationPropagator
 from retrieval.session_manager import SessionManager
-from retrieval.cluster_engine import ClusterEngine
+# 离线分析组件（非检索链路）
+from analysis.deprecated_pipeline.field_detector import FieldDetector
+from analysis.deprecated_pipeline.cluster_engine import ClusterEngine
 from retrieval.tools.navigate import navigate_sphere
 from api.rebuild import rebuild_spaces
 from retrieval.tools.explore import explore_cluster
@@ -806,8 +804,6 @@ class AppState:
         self.faiss_store = FaissStore()
         self.registry = Registry()
         self.sphere_store = SphereStore()
-        self.field_detector = FieldDetector()
-        self.sorter = DiversitySorter()
         self.rewriter = TextRewriter()
         self.calibrator = SphereCalibrator()
         self.conn_detector = None  # 启动时按需创建
@@ -823,30 +819,25 @@ class AppState:
             faiss_store=self.faiss_store,
             registry=self.registry,
             sphere_store=self.sphere_store,
-            field_detector=self.field_detector,
-            diversity_sorter=self.sorter,
-            rewriter=self.rewriter,
         )
-        self.retriever.attach_role_table(self.role_table)
+        self.retriever.build_norms_from_spheres()
+        # 离线分析组件（初始化 + 重建用，不进入检索链路）
+        self.field_detector = FieldDetector()
+        self.cluster_engine = ClusterEngine()
         self.uploads_dir = Path(cfg_paths.uploads_dir)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.wal = WalManager(str(Path(cfg_paths.wal_dir)))
         self.sessions = SessionManager()
-        self.cluster_engine = ClusterEngine()
         self.generator = AnswerGenerator()
 
     def ensure_connections(self):
-        """按需初始化连接检测器并挂载到 retriever"""
+        """按需初始化连接检测器（仅用于离线分析，不挂载到 retriever）"""
         if self.conn_detector is None:
             from pipeline.connections import ConnectionDetector
             self.conn_detector = ConnectionDetector(
                 self.sphere_store, self.faiss_store._vectors
             )
             self.conn_detector.load()
-            self.retriever.attach_connections(
-                self.conn_detector.get_connections,
-                type_checker=self.conn_detector.get_connection_type,
-            )
             self.calibrator.attach(self.sphere_store, self.faiss_store._vectors)
 
     def ensure_role_table(self):
@@ -932,15 +923,14 @@ kb: KnowledgeBase | None = None
 class QueryRequest(BaseModel):
     query: str
     top_k: int = 5
-    fetch_k: int = 100
+    fetch_k: int = 50
     session_id: Optional[str] = None   # 会话追踪
-    field_focus: Optional[str] = None    # 聚焦某场域（null=不聚焦）
     reset_focus: bool = False            # 退出聚焦
     exclude_ids: Optional[List[str]] = None  # 排除已返回的球体
-    mode: str = "poincare"              # simple | gravity | deep | poincare
-    use_activation: Optional[bool] = None # 覆盖激活传播开关
-    use_reranker: Optional[bool] = None   # 覆盖重排器开关
-    max_hops: int = 2                     # 激活传播跳数
+    mode: str = "hyperbolic"            # hyperbolic | cosine（实验开关）
+    use_activation: Optional[bool] = None # （已弃用，保留兼容）
+    use_reranker: Optional[bool] = None   # （已弃用，保留兼容）
+    max_hops: int = 2                     # （已弃用，保留兼容）
 
 
 class QueryResponse(BaseModel):
@@ -1402,41 +1392,19 @@ async def query(request: QueryRequest):
     # 会话管理：通过 kb 访问
     session = kb.sessions.get_or_create(request.session_id)
 
-    # 处理聚焦状态
-    if request.reset_focus:
-        if session:
-            session.reset_focus()
-        effective_focus = None
-    elif request.field_focus is not None:
-        if session:
-            session.set_focus(request.field_focus)
-        effective_focus = request.field_focus
-    elif session and session.field_focus:
-        effective_focus = session.field_focus
-    else:
-        effective_focus = None
-
     # 排除已返回的球体
     exclude = set(request.exclude_ids or [])
     if session:
         exclude |= session.exclude_ids
 
-    # 确保连接层已初始化
-    if request.mode in ("gravity", "deep", "poincare"):
-        state.ensure_connections()
-
     # 通过 kb.query() 统一查询入口
-    q_mode = request.mode if request.mode != "deep" else "poincare"
+    use_hyperbolic = request.mode == "hyperbolic" or request.mode in ("poincare", "gravity", "deep")
     result = kb.query(
         query_text=request.query,
         top_k=request.top_k,
-        mode=q_mode,
         fetch_k=request.fetch_k,
-        field_focus=effective_focus,
         exclude_ids=list(exclude),
-        use_activation=request.use_activation,
-        use_reranker=request.use_reranker,
-        max_hops=request.max_hops,
+        use_hyperbolic=use_hyperbolic,
     )
 
     # 记录返回的球体 ID 到会话

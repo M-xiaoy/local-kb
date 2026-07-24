@@ -141,12 +141,12 @@ def main():
 
     # ── Step 5: 场域质心更新 ──
     logger.info("[5/6] 场域质心同步...")
-    from retrieval.field_detector import FieldDetector
+    from analysis.deprecated_pipeline.field_detector import FieldDetector  # 离线重建用
 
     if not args.dry_run:
         field_detector = FieldDetector()
         # 从聚类引擎同步质心
-        from retrieval.cluster_engine import ClusterEngine
+        from analysis.deprecated_pipeline.cluster_engine import ClusterEngine  # 离线重建用
         engine = ClusterEngine()
         engine.load()
 

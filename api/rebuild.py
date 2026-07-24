@@ -21,7 +21,7 @@ import numpy as np
 
 from storage.faiss_store import FaissStore
 from storage.calibrator import SphereCalibrator
-from retrieval.field_detector import FieldDetector
+from analysis.deprecated_pipeline.field_detector import FieldDetector  # 离线重建用
 from pipeline.norm_deriver import derive_and_write as _old_derive
 from core.hyperbolic.radius_deriver import derive_and_write as radius_derive
 
@@ -57,6 +57,12 @@ async def _rebuild_cluster(state, timings, t0):
     if len(active_spheres) < 2:
         return {"status": "ok", "rebuilt": 0, "message": "Need ≥2 spheres to cluster"}
 
+    # ── 0. 初始化离线分析组件 ─────────────────
+    from analysis.deprecated_pipeline.cluster_engine import ClusterEngine  # 离线重建用
+    from analysis.deprecated_pipeline.field_detector import FieldDetector  # 离线重建用
+    _cluster = ClusterEngine()
+    _field_detector = FieldDetector()
+
     # ── 1. 从 FAISS 缓存收集向量 ────────────────
     vectors = []
     for s in active_spheres:
@@ -74,7 +80,7 @@ async def _rebuild_cluster(state, timings, t0):
     vectors_arr = np.stack(vectors, axis=0)
     loop = asyncio.get_event_loop()
     centroids, labels, scores = await loop.run_in_executor(
-        None, state.cluster_engine.fit_predict, vectors_arr
+        None, _cluster.fit_predict, vectors_arr
     )
     timings["kmeans"] = time.time() - t1
 
@@ -89,10 +95,10 @@ async def _rebuild_cluster(state, timings, t0):
         cluster_counts[sphere.cluster_id] = cluster_counts.get(sphere.cluster_id, 0) + 1
     timings["assign"] = time.time() - t2
 
-    # ── 4. 场域同步 ────────────────────────────
+    # ── 4. 场域同步（仅离线分析用，不挂载到检索） ──
     t3 = time.time()
-    state.field_detector.sync_from_clusters(centroids, label_map, cluster_counts)
-    state.field_detector.rebuild_all_gravity_fields(
+    _field_detector.sync_from_clusters(centroids, label_map, cluster_counts)
+    _field_detector.rebuild_all_gravity_fields(
         state.sphere_store,
         {
             s.id: state.faiss_store._vectors.get(state.registry.faiss_id(s.id))
@@ -104,7 +110,7 @@ async def _rebuild_cluster(state, timings, t0):
 
     # ── 5. 持久化聚类状态 ──────────────────────
     t4 = time.time()
-    state.cluster_engine.save()
+    _cluster.save()
     timings["save_clusters"] = time.time() - t4
 
     # ── 6. 角色表（只增量更新活跃球体） ──────
@@ -198,7 +204,6 @@ async def _rebuild_full(state, timings, t0):
     # ── 1. 清空 + 重载 ─────────────────────────
     state.registry.clear()
     state.faiss_store = FaissStore()
-    state.field_detector = FieldDetector()
 
     state.registry.load()
     state.sphere_store.load()
@@ -256,7 +261,8 @@ async def _rebuild_full(state, timings, t0):
                 field_vectors.setdefault(sphere.source_type, []).append(
                     faiss_store._vectors[fid]
                 )
-    state.field_detector.rebuild_centroids(field_vectors)
+    _field_detector = FieldDetector()
+    _field_detector.rebuild_centroids(field_vectors)
     timings["faiss_build"] = time.time() - t2
 
     # ── 4. 持久化 ──────────────────────────────
