@@ -4,22 +4,32 @@
 所有可调参数集中管理，不散落在各模块中。
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import List
 
+# ── 项目根目录锚点（config.py 所在目录 = local-kb/）──
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve(*parts: str) -> str:
+    """将路径片段解析为基于项目根目录的绝对路径"""
+    return os.path.join(_PROJECT_ROOT, *parts)
+
 
 # ──────────────────────────────────────────────
-# 路径配置
+# 路径配置（全部已解析为绝对路径，不依赖 CWD）
 # ──────────────────────────────────────────────
 @dataclass
 class Paths:
-    faiss_index: str = "data/index/faiss.index"
-    faiss_cache: str = "data/index/faiss_cache.npz"
-    spheres_data: str = "data/spheres/spheres.json"
-    registry_map: str = "data/spheres/registry.json"
-    uploads_dir: str = "data/uploads/"
-    wal_dir: str = "data/wal/"
-    connections_dir: str = "data/connections/"
+    faiss_index: str = _resolve("data", "index", "faiss.index")
+    faiss_cache: str = _resolve("data", "index", "faiss_cache.npz")
+    spheres_data: str = _resolve("data", "spheres", "spheres.json")
+    registry_map: str = _resolve("data", "spheres", "registry.json")
+    uploads_dir: str = _resolve("data", "uploads")
+    wal_dir: str = _resolve("data", "wal")
+    connections_dir: str = _resolve("data", "connections")
+    hierarchy_dir: str = _resolve("data", "hierarchy")
 
 
 # ──────────────────────────────────────────────
@@ -28,16 +38,16 @@ class Paths:
 @dataclass
 class OllamaConfig:
     host: str = "http://localhost:11434"
-    embed_model: str = "nomic-embed-text"
-    embed_dim: int = 768
+    embed_model: str = "bge-m3:latest"
+    embed_dim: int = 1024
     llm_model: str = "qwen2.5:7b"
     llm_temperature: float = 0.3
     llm_max_tokens: int = 2048
     embed_timeout: int = 30
     llm_timeout: int = 120
 
-    embed_doc_prefix: str = "search_document: "
-    embed_query_prefix: str = "search_query: "
+    embed_doc_prefix: str = ""
+    embed_query_prefix: str = ""
 
     embed_batch_size: int = 16
     embed_cache_size: int = 10000
@@ -84,8 +94,26 @@ class PoincareConfig:
     enabled: bool = True
     default_mode: str = "poincare"  # "poincare" | "gravity"
     eps: float = 1e-5
-    # 双曲空间稳定性：控制向量压缩到 Poincaré Ball 的余量
     ball_margin: float = 1e-5
+
+
+# ──────────────────────────────────────────────
+# Poincaré Ball mass→norm 映射配置
+# ──────────────────────────────────────────────
+@dataclass
+class PoincareMappingConfig:
+    """mass→norm 映射参数
+
+    mass [1, 3] → norm [0.1, 0.6]，单调递减。
+    高 mass（多连接/核心）→ 低 norm（近球心/抽象）
+    低 mass（孤点/叶子）→ 高 norm（近球面/具体）
+    query_norm: 查询向量在 Poincaré Ball 中的固定范数（0.3=中等抽象靠球心）
+    """
+    norm_min: float = 0.1
+    norm_max: float = 0.6
+    query_norm: float = 0.3
+    mass_min: float = 1.0
+    mass_max: float = 3.0
 
 
 # ──────────────────────────────────────────────
@@ -110,8 +138,8 @@ class ClusteringConfig:
     random_state: int = 42
     n_init: int = 10
     cluster_threshold: float = 0.3
-    state_file: str = "data/clusters/cluster_state.json"
-    label_map_file: str = "data/clusters/cluster_labels.json"
+    state_file: str = _resolve("data", "clusters", "cluster_state.json")
+    label_map_file: str = _resolve("data", "clusters", "cluster_labels.json")
 
 
 # ──────────────────────────────────────────────
@@ -161,19 +189,23 @@ class RewriterConfig:
 class ConnectionConfig:
     """球体间关系检测参数"""
     enabled: bool = True
-    same_cluster_topk: int = 3          # 同簇取 Top-N 建连接
+    same_cluster_topk: int = 10         # 同簇取 Top-N 建连接（v2: 3→10 增加语义密度）
     same_cluster_weight: float = 0.6    # 同簇连接权重
     entity_threshold: int = 2           # 共享实体 ≥ 此数则建连接
     entity_weight: float = 0.4          # 实体重叠连接权重
+    role_bridge_weight: float = 0.35    # 角色共现间接连接权重（v2 新增）
+    role_bridge_min_cooccur: int = 3    # 共现次数 >= 此值才建桥接（过滤弱共现噪音）
+    role_bridge_max_entity_spread: int = 30  # 实体出现在超过 N 个球体中则不参与桥接（IDF 过滤）
+    role_bridge_phrase_only: bool = True  # 只用 as_phrase（完整 AH 对）建桥接，不用 as_head/as_attributive
     embedding_threshold: float = 0.50   # 跨簇语义相似度阈值（v2 实验：0.65 太紧）
     embedding_weight: float = 0.3       # 跨簇语义连接权重
-    temporal_weight: float = 0.25       # 时序相邻连接权重
+    temporal_weight: float = 0.12       # 时序相邻连接权重（v2: 0.25→0.12 抑制时序噪音）
     cross_cluster_weight: float = 0.2   # 跨簇桥接权重
     min_weight: float = 0.1             # 低于此值不建连接
     prune_threshold: float = 0.05       # 季度修剪阈值
     max_connections_per_sphere: int = 50  # 单球体连接数上限
     decay_per_tick: float = 0.98        # 每 tick 连接衰减系数
-    storage_dir: str = "data/connections/" # 连接表持久化目录
+    storage_dir: str = _resolve("data", "connections")  # 连接表持久化目录
     batch_build_size: int = 50          # 批量构建时的批次大小
 
 
@@ -218,6 +250,18 @@ class RerankerConfig:
     candidate_count: int = 50           # 重排前截断到此数
     top_k_after: int = 20               # 重排后保留数量
     batch_size: int = 5                 # Ollama 每次评分几个候选
+
+
+# ──────────────────────────────────────────────
+# 牵引力配置（Phase 1.6 新增）
+# ──────────────────────────────────────────────
+@dataclass
+class TractionConfig:
+    """检索时牵引力重排序参数"""
+    enabled: bool = True
+    alpha: float = 0.1       # 牵引力强度 [0, 1]，0=关闭
+    min_connection_weight: float = 0.15  # 连接权重低于此值不参与牵引
+    seed_boost: float = 0.0  # 种子球体自身的额外奖励
 
 
 # ──────────────────────────────────────────────
@@ -278,6 +322,8 @@ axon = AxonConfig()
 activation = ActivationConfig()
 reranker = RerankerConfig()
 calibrator = CalibratorConfig()
+traction = TractionConfig()
 
 # Poincaré 双曲检索
 poincare = PoincareConfig()
+poincare_mapping = PoincareMappingConfig()

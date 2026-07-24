@@ -178,11 +178,9 @@ class Embedder:
         FAISS 可用 IP 代替余弦，计算更快。
         """
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        # 避免除零（零向量保持为零）
         norms = np.where(norms == 0, 1.0, norms)
         return vectors / norms
-
-    # ── 缓存 ───────────────────────────────────
+    # ── 缓存 ──────────────────────────
 
     def _cache_key(self, text: str) -> str:
         """生成缓存 key：model + text hash"""
@@ -209,6 +207,48 @@ class Embedder:
         self._cache.clear()
         self._cache_hits = 0
         self._cache_misses = 0
+
+
+# 
+
+
+# ──────────────────────────────────────────────
+# Poincaré Ball 投影
+# ──────────────────────────────────────────────
+
+def poincare_project(vectors: np.ndarray, norms: np.ndarray) -> np.ndarray:
+    """将 L2 归一化的单位向量投影到 Poincaré Ball
+
+    每个向量以其对应的范数缩放：v_poincare = v_unit × norm
+    投影后的向量在 Poincaré Ball 中，可直接存 FAISS。
+    后续用真实 Poincaré 距离重新排序。
+
+    Args:
+        vectors: shape (n, dim) float32，L2 归一化的单位向量
+        norms: shape (n,) 或 (n, 1) float32，每个向量的 Poincaré 范数
+
+    Returns:
+        shape (n, dim) float32，Poincaré Ball 中的向量
+    """
+    norms = np.asarray(norms, dtype=np.float32).reshape(-1, 1)
+    return vectors * norms
+
+
+def poincare_project_query(query_vec: np.ndarray) -> np.ndarray:
+    """查询向量投影到 Poincaré Ball
+
+    查询向量用一个固定 query_norm 缩放（当前 0.3）。
+    这个值位于 Poincaré Ball 的偏球心区域，
+    保证搜索时对高 norm（具体）和低 norm（抽象）都有合理覆盖。
+
+    Args:
+        query_vec: shape (dim,) float32，L2 归一化的查询向量
+
+    Returns:
+        shape (dim,) float32，Poincaré Ball 中的查询向量
+    """
+    from config import poincare_mapping as cfg
+    return query_vec * cfg.query_norm
 
 
 # ──────────────────────────────────────────────

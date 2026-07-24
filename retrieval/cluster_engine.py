@@ -74,12 +74,16 @@ class ClusterEngine:
     # ── 聚类 ──────────────────────────────────
 
     def fit_predict(
-        self, vectors: np.ndarray
+        self, vectors: np.ndarray,
+        sample_weight: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """全量聚类
 
         Args:
             vectors: shape (n, embed_dim), float32, 已 L2 归一化
+            sample_weight: shape (n,) 或 None — 每个样本的权重。
+                          高质量球体（mass 大）更强烈地拉拽簇中心，
+                          使簇中心天然偏向该区域的「引力核心」。
 
         Returns:
             centroids: shape (k, embed_dim), float32, L2 归一化
@@ -111,7 +115,10 @@ class ClusterEngine:
         )
 
         t0 = time.time()
-        model.fit(vectors)
+        if sample_weight is not None:
+            model.fit(vectors, sample_weight=sample_weight)
+        else:
+            model.fit(vectors)
         elapsed = (time.time() - t0) * 1000
 
         centroids = model.cluster_centers_.astype(np.float32)

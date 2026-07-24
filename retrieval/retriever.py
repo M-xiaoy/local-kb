@@ -33,6 +33,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from config import retrieval as cfg_retrieval, activation as cfg_activation, role as cfg_role
+from config import traction as cfg_traction
 from pipeline.embedder import Embedder
 from pipeline.keywords import extract_from_query, match_term_gravity
 from pipeline.rewriter import TextRewriter
@@ -45,6 +46,7 @@ from retrieval.activation import ActivationPropagator
 from retrieval.reranker import LocalReranker
 from retrieval.role_expander import RoleExpander
 from retrieval.poincare_search import PoincareSearch
+from retrieval.traction_reranker import TractionReranker, TractionConfig as TractionRerankerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,15 @@ class Retriever:
         self.reranker = reranker or LocalReranker()
         self.rewriter = rewriter or TextRewriter()
         self.role_expander = RoleExpander()
+        self.traction = TractionReranker(
+            connections_provider=connections_provider,
+            sphere_store=self.spheres,
+            config=TractionRerankerConfig(
+                alpha=cfg_traction.alpha,
+                min_weight=cfg_traction.min_connection_weight,
+                seed_boost=cfg_traction.seed_boost,
+            )
+        )
         self._conn_provider = connections_provider
 
         # 如果 propagator 没有 connections_provider，把我们的设给它
@@ -213,6 +224,9 @@ class Retriever:
 
         if not sphere_ids:
             return self._empty_result(query, timings, t0, mode)
+
+        # ── 保存种子球体 ID（牵引力用，在展开/传播之前）──
+        seed_sphere_ids = list(sphere_ids)
 
         # ── Step 5: 查 Sphere 元数据 ──
         candidate_spheres = self.spheres.get_many(sphere_ids)
@@ -383,6 +397,18 @@ class Retriever:
             sorted_results = fused_results
         timings["term_fusion"] = time.time() - t_term
 
+        # ── Step 10.5: 牵引力重排序 ──
+        use_traction = cfg_traction.enabled and cfg_traction.alpha > 0
+        if use_traction and sorted_results and seed_sphere_ids:
+            t_tract = time.time()
+            sorted_results = self.traction.rerank(
+                sorted_results,
+                seed_sphere_ids=seed_sphere_ids,
+            )
+            timings["traction"] = time.time() - t_tract
+        else:
+            timings["traction"] = 0
+
         # ── Step 11: Context Assembly ──
         # 检查是否有连续 chunk 可以合并
         t_ctx = time.time()
@@ -491,7 +517,9 @@ class Retriever:
 
         # ── Step 3: Poincaré 距离检索 ──
         t_search = time.time()
-        query_norm = 0.5  # 查询保持中性抽象度
+        # 查询范数动态：短查询（词少，偏具体）→ 大范数靠球面；长查询（词多，偏抽象）→ 小范数靠球心
+        word_count = len(query.strip().split())
+        query_norm = max(0.1, min(0.9, 0.9 - 0.05 * word_count))
         try:
             if not self.poincare.is_built:
                 self.poincare.build_from_store(self.faiss)
@@ -519,6 +547,9 @@ class Retriever:
 
         if not sphere_ids:
             return self._empty_result(query, timings, t0, "poincare")
+
+        # ── 保存种子球体 ID（牵引力用）──
+        seed_sphere_ids = list(sphere_ids)
 
         # ── Step 5: 查 Sphere 元数据 ──
         candidate_spheres = self.spheres.get_many(sphere_ids)
@@ -592,6 +623,18 @@ class Retriever:
             fused_results.sort(key=lambda x: -x[1])
             sorted_results = fused_results
         timings["term_fusion"] = time.time() - t_term
+
+        # ── Step 10.5: 牵引力重排序 ──
+        use_traction = cfg_traction.enabled and cfg_traction.alpha > 0
+        if use_traction and sorted_results and seed_sphere_ids:
+            t_tract = time.time()
+            sorted_results = self.traction.rerank(
+                sorted_results,
+                seed_sphere_ids=seed_sphere_ids,
+            )
+            timings["traction"] = time.time() - t_tract
+        else:
+            timings["traction"] = 0
 
         # ── Step 11: Context Assembly ──
         t_ctx = time.time()

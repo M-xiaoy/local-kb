@@ -375,6 +375,22 @@ def make_sphere_id(text: str, source_file: str = "") -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def mass_to_norm(mass: float) -> float:
+    """mass → Poincaré Ball 范数映射
+
+    mass [mass_min, mass_max] → norm [norm_min, norm_max]，单调递减。
+    高 mass = 核心/多连接 → 低 norm = 近球心（抽象）
+    低 mass = 孤点 → 高 norm = 近球面（具体）
+
+    使用的参数值来自 config.poincare_mapping。
+    """
+    from config import poincare_mapping as cfg
+    clamped = max(cfg.mass_min, min(cfg.mass_max, mass))
+    normalized = (clamped - cfg.mass_min) / (cfg.mass_max - cfg.mass_min)
+    norm = cfg.norm_min + (cfg.norm_max - cfg.norm_min) * (1.0 - normalized)
+    return round(float(norm), 4)
+
+
 def make_concept_id(concept_text: str) -> str:
     """从概念文本生成一级球体 ID
 

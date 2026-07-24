@@ -30,3 +30,19 @@ _test_*
 # OS
 .DS_Store
 Thumbs.db
+# Temp/experiment scripts
+_batch_import.py
+_direct_import.py
+_bench_output.txt
+_e2e_test.md
+ablation_*
+benchmark_queries_v1.json
+benchmark/
+test_phase1.py
+.repo_cache/
+
+# Data (generated, stop tracking)
+data/connections.json
+data/benchmark_queries_v1.json
+data/data_pre_restore/
+data/hierarchy/

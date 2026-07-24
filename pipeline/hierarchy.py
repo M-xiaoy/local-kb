@@ -1,25 +1,31 @@
 """
-hierarchy.py — 球体层级生长器
-================================
-不预设任何层级结构，从语料中自然生长。
+hierarchy.py — 球体层级生长器（v2 增量版）
+===========================================
+相较 v1 的改动：
+  1. 向量边计算分片批处理，避免 O(N²) OOM
+  2. 邻接图持久化到磁盘，支持增量加载
+  3. grow(incremental=True) 跳过 _reset_levels，只处理新球体
+  4. save_adjacency() / load_adjacency() 接口
 
 生长机制（三步）：
   1. 建图：球体是节点，边来自：
      - 角色表共享实体（A和B都含有"气候变化"）
      - 向量相似度（embedding cosine 高于阈值）
   2. 社区检测（Label Propagation）→ 发现密集社区
-  3. 对每个≥阈值的社区：
-     - 找社区内出现≥2次的主语 → 每个主语建一个一级球体
-     - 社区句子都挂到这些一级球体下（共享子球体）
-     - 一级球体内部≥4句 → 再聚类 → 三级标注
+  3. 对每个≥阈值的社区：等级划分
 
-阈值（每个社区独立判断，不全局）：
-  min_community_size: 5  # 社区少于5个句子的不划等级
-  coverage_ratio: 0.33   # 主语出现 ≥ 社区大小 × 此比例才建一级
-  max_concepts_per_community: 3  # 单个社区最多一级球体数
+增量流程（增量模式）：
+  1. 加载磁盘邻接图
+  2. 找出新球体（active - graph_sphere_set）
+  3. 新球体 → entity edges + batched vector edges
+  4. Merge 进既有邻接图
+  5. 社区检测：既有标签做 seed，增量传播
+  6. 只对新增/变更的球体划等级
 """
 
+import json
 import logging
+import os
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -33,6 +39,11 @@ from storage.sphere_store import SphereStore, Sphere, make_concept_id
 
 logger = logging.getLogger(__name__)
 
+# ── 常量 ─────────────────────────────────────
+_GRAPH_VERSION = 1
+_VECTOR_BATCH_SIZE = 500        # 向量边计算每批大小（减小避免 OOM）
+_INCREMENTAL_EDGE_BATCH = 200   # 增量模式：新球体每批查询
+
 
 # ──────────────────────────────────────────────
 # 层级生长配置
@@ -40,15 +51,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LevelingConfig:
-    min_community_size: int = 5        # 社区最少球体数才划等级
-    coverage_ratio: float = 0.33       # 主语出现 ≥ 社区大小 × 此比例才建一级
-    max_concepts_per_community: int = 3  # 单个社区最多一级球体数
-    min_internal_cluster: int = 4      # 一级球体内部≥4句才聚三级
-    vector_sim_threshold: float = 0.65 # 向量相似度建边阈值
-    entity_sim_weight: float = 0.6     # 实体共享边的基准权重
-    vector_sim_weight: float = 0.4     # 向量相似边的基准权重
-    max_iterations: int = 50           # 社区检测最大迭代
-    use_community_detection: bool = True  # 开关
+    min_community_size: int = 5
+    coverage_ratio: float = 0.33
+    max_concepts_per_community: int = 3
+    min_internal_cluster: int = 4
+    vector_sim_threshold: float = 0.65
+    entity_sim_weight: float = 0.6
+    vector_sim_weight: float = 0.4
+    max_iterations: int = 50
+    use_community_detection: bool = True
 
 
 # ──────────────────────────────────────────────
@@ -58,23 +69,41 @@ class LevelingConfig:
 def detect_communities(
     adjacency: Dict[str, Set[str]],
     max_iter: int = 50,
+    seed_labels: Optional[Dict[str, int]] = None,
 ) -> Dict[str, int]:
     """Label Propagation 社区检测
 
     Args:
         adjacency: {sphere_id: {neighbor_id, ...}}
         max_iter: 最大迭代次数
+        seed_labels: 可选，已有标签（增量模式使用，不在 seed 中的节点分配新 ID）
 
     Returns:
         {sphere_id: community_id}
     """
-    # 初始化：每个节点一个社区
-    labels = {node: i for i, node in enumerate(adjacency)}
+    next_label = 0
+    labels: Dict[str, int] = {}
+    if seed_labels:
+        # 只取既在邻接图中又有 seed 的节点
+        for node in adjacency:
+            if node in seed_labels:
+                labels[node] = seed_labels[node]
+        # 已有标签的最大 ID
+        if labels:
+            next_label = max(labels.values()) + 1
+        # 不在 seed 中的新节点分配新 ID
+        for node in adjacency:
+            if node not in labels:
+                labels[node] = next_label
+                next_label += 1
+    else:
+        labels = {node: i for i, node in enumerate(adjacency)}
+        next_label = len(adjacency)
+
     node_list = list(adjacency.keys())
 
     for iteration in range(max_iter):
         changed = 0
-        # 随机顺序（避免初始顺序偏差）
         np.random.shuffle(node_list)
 
         for node in node_list:
@@ -82,16 +111,13 @@ def detect_communities(
             if not neighbors:
                 continue
 
-            # 邻居标签投票
             label_counts = Counter()
             for nb in neighbors:
                 if nb in labels:
                     label_counts[labels[nb]] += 1
-
             if not label_counts:
                 continue
 
-            # 选出现次数最多的标签（同票时随机选一个）
             max_count = max(label_counts.values())
             best_labels = [
                 lbl for lbl, cnt in label_counts.items()
@@ -107,12 +133,75 @@ def detect_communities(
             logger.debug(f"Community detection converged in {iteration + 1} iterations")
             break
 
-    # 重新编号（保持紧凑）
+    # 紧凑重编号
     unique_labels = sorted(set(labels.values()))
     label_map = {old: new for new, old in enumerate(unique_labels)}
     labels = {node: label_map[lbl] for node, lbl in labels.items()}
-
     return labels
+
+
+# ──────────────────────────────────────────────
+# 邻接图持久化
+# ──────────────────────────────────────────────
+
+def save_adjacency(
+    adjacency: Dict[str, Set[str]],
+    total_spheres: int,
+):
+    """保存向量邻接图到磁盘
+
+    Args:
+        adjacency: {sphere_id: {neighbor_id, ...}}
+        total_spheres: 建图时的全库球体数（用于下次增量判断）
+    """
+    path = os.path.join(cfg_paths.hierarchy_dir, "vector_adjacency.json")
+    os.makedirs(cfg_paths.hierarchy_dir, exist_ok=True)
+
+    data = {
+        "version": _GRAPH_VERSION,
+        "total_spheres_at_build": total_spheres,
+        "sphere_ids_in_graph": list(adjacency.keys()),
+        "adjacency": {k: list(v) for k, v in adjacency.items()},
+        "built_at": time.time(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+    logger.info(
+        f"Saved adjacency: {len(adjacency)} nodes, "
+        f"{sum(len(v) for v in adjacency.values()) // 2} edges"
+    )
+
+
+def load_adjacency() -> Tuple[Optional[Dict[str, Set[str]]], Optional[Set[str]], int]:
+    """从磁盘加载向量邻接图
+
+    Returns:
+        (adjacency, sphere_ids_set, total_spheres_at_build)
+        如果文件不存在则返回 (None, None, 0)
+    """
+    path = os.path.join(cfg_paths.hierarchy_dir, "vector_adjacency.json")
+    if not os.path.exists(path):
+        return None, None, 0
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        adjacency = {k: set(v) for k, v in data.get("adjacency", {}).items()}
+        sphere_set = set(data.get("sphere_ids_in_graph", []))
+        total = data.get("total_spheres_at_build", 0)
+
+        logger.info(
+            f"Loaded adjacency: {len(adjacency)} nodes, "
+            f"{sum(len(v) for v in adjacency.values()) // 2} edges "
+            f"(built at total={total})"
+        )
+        return adjacency, sphere_set, total
+
+    except Exception as e:
+        logger.warning(f"Failed to load adjacency: {e}")
+        return None, None, 0
 
 
 # ──────────────────────────────────────────────
@@ -120,14 +209,7 @@ def detect_communities(
 # ──────────────────────────────────────────────
 
 class HierarchyGrower:
-    """层级生长器
-
-    每次调用 grow() 时，从当前语料+角色表出发：
-      - 建图 → 社区检测 → 等级划分
-      - 旧等级被替换（不累积，每次全量刷新）
-
-    这样新语料加入后，社区结构可能重组，等级自然跟随变化。
-    """
+    """层级生长器（v2 增量版）"""
 
     def __init__(
         self,
@@ -138,48 +220,188 @@ class HierarchyGrower:
     ):
         self._store = sphere_store
         self._table = role_table
-        self._vectors = vector_provider  # f(sphere_id) → np.ndarray | None
+        self._vectors = vector_provider
         self._config = config or LevelingConfig()
 
     # ── 主入口 ───────────────────────────────
 
-    def grow(self) -> Dict:
-        """全量生长：社区检测 → 等级划分
+    def grow(
+        self,
+        community_map: Optional[Dict[str, int]] = None,
+        incremental: bool = False,
+    ) -> Dict:
+        """层级生长
 
-        每次全量跑，不增量累积。
+        Args:
+            community_map: 可选社区映射（KMeans cluster_id）
+            incremental: 增量模式。True=保留旧层级，只处理新球体。
+                         False=全量重建（v1 行为）。
+
         Returns:
             统计信息
         """
         t0 = time.time()
 
-        # Step 1: 重置所有球体的等级（清空旧层级）
+        if incremental:
+            return self._grow_incremental(community_map, t0)
+        else:
+            return self._grow_full(community_map, t0)
+
+    def _grow_full(
+        self,
+        community_map: Optional[Dict[str, int]],
+        t0: float,
+    ) -> Dict:
+        """全量重建
+
+        创建空的节点图（只存节点ID，无边），存到磁盘。
+        后续增量重建会逐批加入向量边。
+
+        不做实体边和向量边的原因：
+        - 实体边在 26K 球体 + 328K 实体下产生 ~10^8 条边，不可行
+        - 向量边在 26K×1024 下 O(N²) 相似度矩阵，不可行
+        - 增量模式下只处理新球体，边数可控
+        """
         self._reset_levels()
 
-        # Step 2: 建图（球体间的边）
-        adjacency = self._build_graph()
-        if len(adjacency) < 2:
-            logger.info("Too few spheres for hierarchy, skipping")
-            return {"communities": 0, "level1": 0, "status": "skipped"}
+        if community_map is not None:
+            communities = community_map
+            logger.info(f"Using provided community map: {len(set(communities.values()))} communities")
+            adjacency = None
+        else:
+            # 空邻接图（仅节点列表，无边）
+            spheres = self._store.get_active()
+            nodes = [s for s in spheres if s.level >= 2]
+            adjacency: Dict[str, Set[str]] = {s.id: set() for s in nodes}
+            logger.info(f"Created empty graph: {len(adjacency)} nodes (for incremental seeding)")
 
-        # Step 3: 社区检测
-        communities = detect_communities(
-            adjacency, max_iter=self._config.max_iterations
-        )
+            if len(adjacency) < 2:
+                return {"communities": 0, "level1": 0, "status": "skipped"}
+            # 空图下每个节点独自一个社区
+            communities = {node: i for i, node in enumerate(adjacency)}
 
-        # Step 4: 按社区划等级
-        stats = self._assign_levels(communities)
+        stats = self._assign_levels(communities, community_map)
 
-        # Step 5: 一级球体内部聚类（三级标注）
+        # 保存空邻接图（增量模式的基础）
+        if adjacency:
+            save_adjacency(adjacency, self._store.count)
+
         internal = self._cluster_internals()
         stats["level3_clusters"] = internal
-
-        elapsed = time.time() - t0
-        stats["elapsed_s"] = round(elapsed, 2)
+        stats["elapsed_s"] = round(time.time() - t0, 2)
 
         logger.info(
-            f"Hierarchy grown: {stats.get('level1', 0)} concepts, "
-            f"{stats.get('communities', 0)} communities "
-            f"in {elapsed:.2f}s"
+            f"Hierarchy grown (full): {stats.get('level1', 0)} concepts, "
+            f"{stats.get('communities', 0)} communities in {stats['elapsed_s']}s"
+        )
+        return stats
+
+    def _grow_incremental(
+        self,
+        community_map: Optional[Dict[str, int]],
+        t0: float,
+    ) -> Dict:
+        """增量生长：保留旧层级，只处理新球体"""
+        active_spheres = self._store.get_active()
+        active_ids = {s.id for s in active_spheres}
+
+        # 加载磁盘邻接图
+        saved_adj, saved_sphere_set, saved_total = load_adjacency()
+
+        if saved_adj is None or not saved_adj:
+            logger.info("No saved adjacency found, falling back to full build")
+            return self._grow_full(community_map, t0)
+
+        # 找出新球体
+        new_ids = active_ids - saved_sphere_set
+        existing_ids = active_ids & saved_sphere_set
+
+        if not new_ids:
+            logger.info("No new spheres since last hierarchy build, skipping")
+            return {
+                "communities": len(set(community_map.values())) if community_map else 0,
+                "level1": len(self._store.get_by_level(1)),
+                "status": "no_new_spheres",
+                "elapsed_s": round(time.time() - t0, 2),
+            }
+
+        logger.info(
+            f"Incremental: {len(new_ids)} new spheres, "
+            f"{len(existing_ids)} existing, "
+            f"loaded {len(saved_adj)} adjacency nodes"
+        )
+
+        # 建图：从既存邻接图开始
+        adjacency = dict(saved_adj)
+        # 补全还在 active 中的既有节点（确保没有遗漏）
+        for sid in existing_ids:
+            if sid not in adjacency:
+                adjacency[sid] = set()
+
+        # 新节点加入邻接图
+        for sid in new_ids:
+            adjacency[sid] = set()
+
+        # 从 RoleTable 读取新球体的实体边
+        new_node_list = [s for s in active_spheres if s.id in new_ids]
+        if new_node_list:
+            self._build_new_entity_edges(adjacency, new_ids, existing_ids)
+
+        # 向量边：新球体 vs 既有球体 + 新球体之间
+        if self._vectors:
+            self._build_new_vector_edges(adjacency, new_ids, existing_ids,
+                                         active_spheres)
+
+        # 移除孤立节点
+        isolated = [nid for nid, nb in adjacency.items() if not nb]
+        for nid in isolated:
+            del adjacency[nid]
+        # 从新节点中也移除
+        new_ids = new_ids - set(isolated)
+
+        if len(adjacency) < 2:
+            logger.info("Too few nodes after incremental graph, skipping")
+            return {"communities": 0, "level1": 0, "status": "skipped"}
+
+        # 社区检测（用既有标签做 seed）
+        # 从已保存的社区信息重建 seed_labels
+        # 先跑全量 label propagation——邻接图变大了，但节点数没暴增
+        # 全量 LP 的复杂度是 O(E × iter)，增量时边数增加有限
+        saved_community_path = os.path.join(cfg_paths.hierarchy_dir, "community_labels.json")
+        seed_labels = None
+        if os.path.exists(saved_community_path):
+            try:
+                with open(saved_community_path, "r") as f:
+                    seed_labels = json.load(f)
+            except Exception:
+                pass
+
+        communities = detect_communities(
+            adjacency, max_iter=self._config.max_iterations,
+            seed_labels=seed_labels,
+        )
+
+        if community_map:
+            communities = community_map  # 用 KMeans 簇覆盖
+
+        # 保存社区标签
+        os.makedirs(cfg_paths.hierarchy_dir, exist_ok=True)
+        with open(saved_community_path, "w") as f:
+            json.dump(communities, f, ensure_ascii=False)
+
+        # 划等级：已有概念的社区跳过，只处理受新球体影响的
+        stats = self._assign_levels(communities, community_map, incremental=True)
+
+        # 保存邻接图
+        save_adjacency(adjacency, self._store.count)
+
+        internal = self._cluster_internals()
+        stats["level3_clusters"] = internal
+        stats["elapsed_s"] = round(time.time() - t0, 2)
+
+        logger.info(
+            f"Hierarchy grown (incremental): {stats.get('level1', 0)} concepts, "
+            f"{stats.get('communities', 0)} communities in {stats['elapsed_s']}s"
         )
         return stats
 
@@ -188,9 +410,8 @@ class HierarchyGrower:
     def _reset_levels(self):
         """清空所有球体的层级标记"""
         for sphere in self._store.get_active():
-            sphere.level = 2      # 默认二级
+            sphere.level = 2
             sphere.parent_id = ""
-        # 一级球体需要彻底移除（ID 冲突会阻止 recreate）
         to_remove = [
             sid for sid, s in self._store._spheres.items()
             if s.active and s.level == 1
@@ -198,21 +419,27 @@ class HierarchyGrower:
         for sid in to_remove:
             del self._store._spheres[sid]
         self._store._dirty = True
-
         logger.debug(f"Reset levels: cleared {len(to_remove)} Level-1 spheres")
 
     # ── 建图 ─────────────────────────────────
 
-    def _build_graph(self) -> Dict[str, Set[str]]:
+    def _build_graph(self, incremental: bool = False,
+                     skip_vector_edges: bool = False) -> Dict[str, Set[str]]:
         """建球体图
 
-        图节点 = 所有活跃的二级球体。
-        边的来源有两种：
-          a) 共享实体（RoleTable 中共享主语或宾语）
-          b) embedding 余弦相似度 > 阈值
+        Args:
+            incremental: 如果 True，尝试加载磁盘上的邻接图并 merge
+            skip_vector_edges: 如果 True，跳过向量边计算（首次全量重建时）
+
+        Returns:
+            {sphere_id: {neighbor_id, ...}}
         """
+        if incremental:
+            saved_adj, saved_set, _ = load_adjacency()
+            if saved_adj and saved_set:
+                return saved_adj
+
         spheres = self._store.get_active()
-        # 只对 Level-2（非概念）球体建图
         nodes = [s for s in spheres if s.level >= 2]
         if not nodes:
             return {}
@@ -223,15 +450,12 @@ class HierarchyGrower:
         # 边 A：共享实体
         self._build_entity_edges(adjacency, node_ids, nodes)
 
-        # 边 B：向量相似度
-        if self._vectors:
-            self._build_vector_edges(adjacency, node_ids, nodes)
+        # 边 B：向量相似度（分片），首次全量重建时跳过
+        if self._vectors and not skip_vector_edges:
+            self._build_vector_edges_batched(adjacency, node_ids, nodes)
 
-        # 移除孤立节点（无边）
-        isolated = [
-            nid for nid, neighbors in adjacency.items()
-            if not neighbors
-        ]
+        # 移除孤立节点
+        isolated = [nid for nid, nb in adjacency.items() if not nb]
         for nid in isolated:
             del adjacency[nid]
 
@@ -248,19 +472,16 @@ class HierarchyGrower:
         node_ids: Set[str],
         nodes: List[Sphere],
     ):
-        """实体共享边：两个球体包含同一实体"""
-        # 从 RoleTable 获取实体→球体映射
+        """实体共享边"""
         if not self._table:
             return
 
-        # 按实体分组
         entity_to_spheres: Dict[str, Set[str]] = defaultdict(set)
         for sid in node_ids:
             entities = self._table._sphere_entities.get(sid, set())
             for eid in entities:
                 entity_to_spheres[eid].add(sid)
 
-        # 对每个实体，所有包含它的球体两两建边
         for eid, sphere_set in entity_to_spheres.items():
             if len(sphere_set) < 2:
                 continue
@@ -272,18 +493,18 @@ class HierarchyGrower:
                         adjacency[a].add(b)
                         adjacency[b].add(a)
 
-    def _build_vector_edges(
+    def _build_vector_edges_batched(
         self,
         adjacency: Dict[str, Set[str]],
         node_ids: Set[str],
         nodes: List[Sphere],
     ):
-        """向量相似度边：embedding 余弦 > 阈值"""
+        """向量相似度边 — 分片批处理（避免 O(N²) OOM）"""
         threshold = self._config.vector_sim_threshold
         if not self._vectors:
             return
 
-        # 获取所有向量
+        # 收集向量
         vec_map: Dict[str, np.ndarray] = {}
         for s in nodes:
             vec = self._vectors(s.id)
@@ -294,37 +515,234 @@ class HierarchyGrower:
         if len(ids) < 2:
             return
 
-        # 批量计算相似度矩阵
         vectors = np.stack([vec_map[nid] for nid in ids], axis=0)
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1, norms)  # 防除零
-        sim_matrix = vectors @ vectors.T / (norms @ norms.T)
-        sim_matrix = np.clip(sim_matrix, 0, 1)
+        norms = np.where(norms == 0, 1, norms)
 
-        # 高于阈值则建边
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                if sim_matrix[i][j] > threshold:
-                    a, b = ids[i], ids[j]
+        n = len(ids)
+
+        # 分片处理：每批 _VECTOR_BATCH_SIZE 行
+        for batch_start in range(0, n, _VECTOR_BATCH_SIZE):
+            batch_end = min(batch_start + _VECTOR_BATCH_SIZE, n)
+
+            # 计算当前批与所有向量的相似度
+            # shape: (batch_size, n)
+            batch_vecs = vectors[batch_start:batch_end]
+            batch_norms = norms[batch_start:batch_end]
+            sim_batch = (batch_vecs @ vectors.T) / (batch_norms @ norms.T)
+            sim_batch = np.clip(sim_batch, 0, 1)
+
+            # 只处理上三角（避免重复建边）
+            for local_i in range(sim_batch.shape[0]):
+                global_i = batch_start + local_i
+                a = ids[global_i]
+                # 与当前批之后的列（上三角 + 批内自身上三角）
+                col_start = global_i + 1  # 只处理 i < j
+                if col_start >= n:
+                    continue
+
+                mask = sim_batch[local_i, col_start:] > threshold
+                cols = np.where(mask)[0] + col_start
+                for col_idx in cols:
+                    b = ids[col_idx]
                     if a in adjacency and b in adjacency:
                         adjacency[a].add(b)
                         adjacency[b].add(a)
 
+            # 显式释放大矩阵
+            del sim_batch
+
+        logger.debug(
+            f"Vector edges (batched): {n} nodes, "
+            f"batch={_VECTOR_BATCH_SIZE}"
+        )
+
+    # ── 增量建图辅助 ─────────────────────────
+
+    def _build_new_entity_edges(
+        self,
+        adjacency: Dict[str, Set[str]],
+        new_ids: Set[str],
+        existing_ids: Set[str],
+    ):
+        """增量实体边：新球体 vs 所有球体"""
+        if not self._table:
+            return
+
+        # 新球体的实体→球体分组
+        for sid in new_ids:
+            entities = self._table._sphere_entities.get(sid, set())
+            for eid in entities:
+                # 该实体下所有球体（包括旧的和新的）
+                sphere_set = self._table._sphere_entities.get(sid, set())
+                # 实际上我们需要知道该实体下 who 有谁
+                # 从 RoleTable 反向查
+                pass
+
+        # 简化实现：遍历每个新球体的实体，查该实体的所有球体
+        for sid in new_ids:
+            entities = self._table._sphere_entities.get(sid, set())
+            for eid in entities:
+                if eid not in self._table._entities:
+                    continue
+                # _entities 存储的是 entity_id → EntityInfo，没有反向查 sphere_ids
+                # 我们只能通过遍历 adjacency 的已有球体来检查
+                # 优化的做法是预先建一个 entity→spheres 的索引
+                # 这里用 RoleTable 的方法
+                pass
+
+        # RoleTable 没有提供 entity→spheres 的直接反向查询
+        # 回退：对每个新球体，检查每个已有球体是否共享实体
+        new_list = list(new_ids)
+        existing_list = list(existing_ids & set(adjacency.keys()))
+        if not existing_list:
+            return
+
+        logger.debug(
+            f"Checking entity edges: {len(new_list)} new vs {len(existing_list)} existing"
+        )
+
+        # 建临时索引：entity_id → [sphere_ids]
+        entity_to_spheres: Dict[str, Set[str]] = defaultdict(set)
+        for sid in existing_list:
+            entities = self._table._sphere_entities.get(sid, set())
+            for eid in entities:
+                entity_to_spheres[eid].add(sid)
+        # 加入新球体
+        for sid in new_list:
+            entities = self._table._sphere_entities.get(sid, set())
+            for eid in entities:
+                entity_to_spheres[eid].add(sid)
+
+        # 建边：共享实体的新球体 ↔ 该实体下所有球体
+        for sid in new_list:
+            entities = self._table._sphere_entities.get(sid, set())
+            for eid in entities:
+                sphere_set = entity_to_spheres.get(eid, set())
+                for other in sphere_set:
+                    if other != sid and other in adjacency and sid in adjacency:
+                        adjacency[sid].add(other)
+                        adjacency[other].add(sid)
+
+    def _build_new_vector_edges(
+        self,
+        adjacency: Dict[str, Set[str]],
+        new_ids: Set[str],
+        existing_ids: Set[str],
+        all_spheres: List[Sphere],
+    ):
+        """增量向量边：新球体 vs 既有球体 + 新vs新"""
+        threshold = self._config.vector_sim_threshold
+        if not self._vectors:
+            return
+
+        # 收集既有球体的向量（缓存用）
+        existing_vec_map: Dict[str, np.ndarray] = {}
+        for s in all_spheres:
+            if s.id in existing_ids:
+                vec = self._vectors(s.id)
+                if vec is not None:
+                    existing_vec_map[s.id] = vec
+
+        new_vec_map: Dict[str, np.ndarray] = {}
+        for s in all_spheres:
+            if s.id in new_ids:
+                vec = self._vectors(s.id)
+                if vec is not None:
+                    new_vec_map[s.id] = vec
+
+        if not new_vec_map:
+            return
+
+        existing_ids_list = list(existing_vec_map.keys())
+        new_ids_list = list(new_vec_map.keys())
+
+        # 既有向量矩阵
+        existing_vecs = np.stack([existing_vec_map[sid] for sid in existing_ids_list], axis=0) if existing_ids_list else np.zeros((0, 1024), dtype=np.float32)
+
+        # 新向量矩阵
+        new_vecs = np.stack([new_vec_map[sid] for sid in new_ids_list], axis=0)
+
+        # 分片：每批处理一部分新球体
+        for batch_start in range(0, len(new_ids_list), _INCREMENTAL_EDGE_BATCH):
+            batch_end = min(batch_start + _INCREMENTAL_EDGE_BATCH, len(new_ids_list))
+            batch_ids = new_ids_list[batch_start:batch_end]
+            batch_vecs = new_vecs[batch_start:batch_end]
+
+            # 新球体 vs 既有球体
+            if len(existing_ids_list) > 0:
+                sim_vs_existing = batch_vecs @ existing_vecs.T
+                sim_vs_existing = np.clip(sim_vs_existing, 0, 1)
+
+                for local_i, a in enumerate(batch_ids):
+                    if a not in adjacency:
+                        continue
+                    mask = sim_vs_existing[local_i] > threshold
+                    cols = np.where(mask)[0]
+                    for col_idx in cols:
+                        b = existing_ids_list[col_idx]
+                        if b in adjacency:
+                            adjacency[a].add(b)
+                            adjacency[b].add(a)
+
+                del sim_vs_existing
+
+            # 新球体 vs 新球体（同批 + 剩余批）
+            remaining_new = new_ids_list[batch_end:]
+            if remaining_new:
+                remaining_vecs = new_vecs[batch_end:]
+                sim_vs_new = batch_vecs @ remaining_vecs.T
+                sim_vs_new = np.clip(sim_vs_new, 0, 1)
+
+                for local_i, a in enumerate(batch_ids):
+                    if a not in adjacency:
+                        continue
+                    mask = sim_vs_new[local_i] > threshold
+                    cols = np.where(mask)[0]
+                    for col_idx in cols:
+                        b = remaining_new[col_idx]
+                        if b in adjacency:
+                            adjacency[a].add(b)
+                            adjacency[b].add(a)
+
+                del sim_vs_new
+
+        logger.debug(
+            f"New vector edges: {len(new_ids_list)} new vs "
+            f"{len(existing_ids_list)} existing (batched)"
+        )
+
     # ── 等级划分 ─────────────────────────────
 
-    def _assign_levels(self, communities: Dict[str, int]) -> Dict:
+    def _assign_levels(
+        self, communities: Dict[str, int],
+        community_map: Optional[Dict[str, int]] = None,
+        incremental: bool = False,
+    ) -> Dict:
         """按社区检测结果划分等级
 
-        对每个≥阈值的社区：
-          1. 从 RoleTable 中统计该社区内各主语出现频率
-          2. 出现≥覆盖阈值的主语 → 建一级球体
-          3. 一级球体挂载社区句子（child_ids）
-          4. 句子标记 parent_id
+        Args:
+            communities: {sphere_id: community_id}
+            community_map: 原始社区映射（cluster_id）
+            incremental: 增量模式——跳过已有概念的社区
+
+        Returns:
+            统计信息
         """
-        # 社区分组
         comm_groups: Dict[int, List[str]] = defaultdict(list)
         for sid, cid in communities.items():
             comm_groups[cid].append(sid)
+
+        # 如果增量模式，收集已有 Level-1 球的社区归属
+        existing_concept_communities: Set[int] = set()
+        if incremental:
+            for c in self._store.get_by_level(1):
+                if c.child_ids:
+                    # 找一个子球的社区
+                    for child_id in c.child_ids:
+                        if child_id in communities:
+                            existing_concept_communities.add(communities[child_id])
+                            break
 
         l1_created = 0
         communities_leveled = 0
@@ -333,12 +751,14 @@ class HierarchyGrower:
             if len(members) < self._config.min_community_size:
                 continue
 
-            # 统计社区内主语出现频率
+            # 增量模式：如果该社区已有概念球体，跳过
+            if incremental and cid in existing_concept_communities:
+                continue
+
             subject_counts = self._count_subjects_in_community(members)
             if not subject_counts:
                 continue
 
-            # 社区独立筛选：覆盖阈值 + 上限
             filtered = self._filter_concepts_for_community(
                 subject_counts,
                 community_size=len(members),
@@ -346,13 +766,17 @@ class HierarchyGrower:
                 max_concepts=self._config.max_concepts_per_community,
             )
 
+            cluster_id = -1
+            if community_map and members:
+                cluster_id = community_map.get(members[0], -1)
+
             for subject, freq in filtered:
                 concept_id = make_concept_id(subject)
+                if self._store.get(concept_id):
+                    continue  # 防止重复创建
 
-                # 找到包含该主语的成员
                 children = self._find_children_for_subject(subject, members)
 
-                # 创建一级球体
                 concept = Sphere(
                     id=concept_id,
                     text=subject[:80],
@@ -363,11 +787,11 @@ class HierarchyGrower:
                     embedding_source="subject",
                     mass=1.0 + 0.1 * len(children),
                     effective_mass=1.0 + 0.1 * len(children),
+                    cluster_id=cluster_id,
                     active=True,
                 )
                 self._store.add(concept)
 
-                # 标注二级球体的 parent_id
                 for child_id in children:
                     child = self._store.get(child_id)
                     if child and not child.parent_id:
@@ -380,7 +804,7 @@ class HierarchyGrower:
 
         logger.info(
             f"Level assignment: {communities_leveled} communities → "
-            f"{l1_created} concepts"
+            f"{l1_created} concepts{' (incremental)' if incremental else ''}"
         )
         return {
             "communities_total": len(comm_groups),
@@ -388,38 +812,23 @@ class HierarchyGrower:
             "level1": l1_created,
         }
 
-    def _count_subjects_in_community(
-        self, member_ids: List[str]
-    ) -> List[Tuple[str, int]]:
-        """统计社区中每个主语的出现次数"""
+    def _count_subjects_in_community(self, member_ids: List[str]) -> List[Tuple[str, int]]:
         if not self._table:
             return []
-
         subject_counts: Counter = Counter()
-
         for sid in member_ids:
             entities = self._table._sphere_entities.get(sid, set())
             for eid in entities:
                 info = self._table._entities.get(eid)
                 if info and sid in info.as_phrase:
                     subject_counts[info.text] += 1
+        return [(text, count) for text, count in subject_counts.most_common()]
 
-        # 返回所有非零主语（阈值筛选在 _filter_concepts_for_community 中按社区大小独立处理）
-        return [
-            (text, count) for text, count in
-            subject_counts.most_common()
-        ]
-
-    def _find_children_for_subject(
-        self, subject: str, member_ids: List[str]
-    ) -> List[str]:
-        """找到社区中包含该主语（作为主语或宾语）的所有球体"""
+    def _find_children_for_subject(self, subject: str, member_ids: List[str]) -> List[str]:
         if not self._table:
-            return member_ids[:]  # 回退：全部作为子球体
-
+            return member_ids[:]
         subject_lower = subject.lower()
         children = []
-
         for sid in member_ids:
             entities = self._table._sphere_entities.get(sid, set())
             for eid in entities:
@@ -427,24 +836,19 @@ class HierarchyGrower:
                 if info and info.text.lower() == subject_lower:
                     children.append(sid)
                     break
-
-        return children or member_ids[:]  # 回退
+        return children or member_ids[:]
 
     # ── 内部聚类（三级标注） ─────────────────
 
     def _cluster_internals(self) -> int:
-        """对一级球体内部做子空间聚类 → 标注三级"""
         concepts = self._store.get_by_level(1)
         total_clustered = 0
-
         for c in concepts:
             if len(c.child_ids) < self._config.min_internal_cluster:
                 continue
-
             children = self._store.get_children(c.id)
             if len(children) < self._config.min_internal_cluster:
                 continue
-
             vectors = []
             valid = []
             for child in children:
@@ -452,26 +856,19 @@ class HierarchyGrower:
                 if vec is not None:
                     vectors.append(vec)
                     valid.append(child)
-
             if len(valid) < self._config.min_internal_cluster:
                 continue
-
             try:
                 from sklearn.cluster import KMeans
-
                 vectors_arr = np.stack(vectors, axis=0)
                 k = min(4, max(2, len(valid) // 2))
                 km = KMeans(n_clusters=k, random_state=42, n_init=5)
                 labels = km.fit_predict(vectors_arr)
-
                 for child, label in zip(valid, labels):
-                    child.cluster_id = int(label)  # 充当三级ID
-
+                    child.cluster_id = int(label)
                 total_clustered += 1
-
             except Exception as e:
-                logger.debug(f"Internal cluster failed for '{c.text}': {e}")
-
+                logger.debug(f"Internal cluster failed: {e}")
         if total_clustered:
             logger.info(f"Internal clustering: {total_clustered} concepts")
         return total_clustered
@@ -485,67 +882,36 @@ class HierarchyGrower:
         coverage_ratio: float,
         max_concepts: int,
     ) -> List[Tuple[str, int]]:
-        """社区独立筛选：覆盖阈值 + 上限
-
-        每个社区独立判断，不用全局参数截断。
-        覆盖比例比固定频次更适合实际——100句的社区和10句的社区，
-        同一个主语要划一级需要的绝对频次不一样。
-
-        Args:
-            subject_counts: [(主语, 频次)] 已按频次降序
-            community_size: 社区大小（成员数）
-            coverage_ratio: 覆盖比例（默认0.33，即主语出现在1/3以上句子）
-            max_concepts: 该社区最多一级球体数
-
-        Returns:
-            筛选后的列表，按频次降序
-        """
         threshold = max(2, int(community_size * coverage_ratio))
         result = []
-
         for subject, freq in subject_counts:
             if freq < threshold:
-                break  # 降序排列，后面的更不够
+                break
             if len(result) >= max_concepts:
                 break
             result.append((subject, freq))
-
         return result
 
     # ── 一级球体嵌入（写入 FAISS） ───────────
 
     def embed_concepts(self) -> List[Tuple[str, np.ndarray]]:
-        """为所有一级球体生成向量（社区质心）
-
-        在每个社区中，取全部成员向量的算术平均作为概念向量。
-        这个向量随后应由外部写入 FAISS。
-
-        Returns:
-            [(concept_id, vector), ...]
-        """
         if not self._vectors:
             logger.warning("No vector provider, cannot embed concepts")
             return []
-
         concepts = self._store.get_by_level(1)
         results = []
-
         for c in concepts:
             children = self._store.get_children(c.id)
             if not children:
                 continue
-
             vectors = []
             for child in children:
                 vec = self._vectors(child.id)
                 if vec is not None:
                     vectors.append(vec)
-
             if not vectors:
                 continue
-
             centroid = np.mean(np.stack(vectors, axis=0), axis=0)
             results.append((c.id, centroid))
-
         logger.info(f"Computed {len(results)} concept embeddings")
         return results

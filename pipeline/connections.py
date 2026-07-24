@@ -68,12 +68,14 @@ class ConnectionDetector:
     """球体连接检测器"""
 
     def __init__(self, sphere_store=None, vectors_cache=None,
-                 store_path: Optional[str] = None):
+                 store_path: Optional[str] = None,
+                 role_table=None):
         """
         Args:
             sphere_store: SphereStore 实例
             vectors_cache: {sphere_id: np.ndarray} 向量缓存
             store_path: 连接表持久化路径
+            role_table: RoleTable 实例（用于实体重叠+角色桥接连接）
         """
         self._store = sphere_store
         self._vectors = vectors_cache or {}
@@ -81,6 +83,41 @@ class ConnectionDetector:
         self._connections: Dict[str, Dict[str, float]] = {}
         self._axon_types: Dict[tuple, str] = {}  # {(a,b): direction, ...} 轴突边方向
         self._dirty = False
+        self._role_table = role_table
+
+        # 角色桥接缓存（延迟构建）
+        self._entity_to_spheres: Dict[str, List[str]] = {}  # entity_id → [sphere_id]
+        self._entity_to_cooccur: Dict[str, List[Tuple[str, int]]] = {}  # entity_id → [(other_id, count)]
+
+    # ── 关联角色表 ───────────────────────────
+
+    def attach_role_table(self, role_table):
+        """关联角色共现表（用于实体重叠+角色桥接连接）"""
+        self._role_table = role_table
+        self._build_role_cache()
+
+    def _build_role_cache(self):
+        """构建角色表缓存：实体→球体反查索引"""
+        if not self._role_table:
+            return
+
+        # entity_id → [sphere_ids]
+        s2e = getattr(self._role_table, '_sphere_entities', {})
+        if not s2e:
+            s2e = getattr(self._role_table, 'sphere_entities', {})
+        self._entity_to_spheres.clear()
+        for sid, eids in s2e.items():
+            for eid in eids:
+                self._entity_to_spheres.setdefault(eid, []).append(sid)
+
+        # entity_id co-occurrence (from RoleTable._entities co_occurrences)
+        entities = getattr(self._role_table, '_entities', {})
+        self._entity_to_cooccur.clear()
+        for eid, ent in entities.items():
+            co = getattr(ent, 'co_occurrences', {}) or {}
+            if co:
+                sorted_co = sorted(co.items(), key=lambda x: -x[1])[:10]
+                self._entity_to_cooccur[eid] = sorted_co
 
     # ── 关联存储 ─────────────────────────────
 
@@ -471,6 +508,121 @@ class ConnectionDetector:
                 weight = cfg.temporal_weight
                 self._add_connection(sids[i], sids[i + 1], weight)
                 total_connections += 1
+
+        # ── 实体重叠连接（使用角色表）──
+        # 修复：Sphere 对象没有 entities 字段，必须从 role_table 拿
+        if self._role_table:
+            if not self._entity_to_spheres:
+                self._build_role_cache()
+
+            s2e = getattr(self._role_table, '_sphere_entities', {})
+            if s2e:
+                from collections import Counter
+                entity_total = sum(len(eids) for eids in s2e.values())
+                logger.info(f"Adding entity overlap connections from {entity_total} entity mappings...")
+                entity_overlap = 0
+
+                # 对每个球体，找到与其共享实体的其他球体
+                for sphere in spheres:
+                    my_entities = s2e.get(sphere.id, [])
+                    if not my_entities:
+                        continue
+                    # 统计与每个其他球体共享的实体数
+                    shared_count = Counter()
+                    for eid in my_entities:
+                        for other_sid in self._entity_to_spheres.get(eid, []):
+                            if other_sid != sphere.id:
+                                shared_count[other_sid] += 1
+                    # 超过阈值的建连接
+                    my_set = set(my_entities)
+                    for other_sid, count in shared_count.items():
+                        if count >= cfg.entity_threshold:
+                            other_entities = s2e.get(other_sid, [])
+                            union = len(my_set | set(other_entities))
+                            ratio = count / max(union, 1)
+                            weight = cfg.entity_weight * (0.6 + 0.4 * ratio)
+                            weight = max(cfg.min_weight, min(weight, cfg.entity_weight))
+                            self._add_connection(sphere.id, other_sid, weight)
+                            entity_overlap += 1
+
+                if entity_overlap:
+                    logger.info(f"  Entity overlap: {entity_overlap} edges")
+                    total_connections += entity_overlap
+
+        # ── 角色桥接连接（v3：降噪版）──
+        # 逻辑：实体 A↔B 共现 → 含 A 的球体 ↔ 含 B 的球体
+        # 降噪三刀：
+        #   1. 只用 as_phrase（完整 AH 对），不用裸名词
+        #   2. 共现次数 >= role_bridge_min_cooccur
+        #   3. 实体出现在 > max_entity_spread 个球体中 → 跳过（IDF 过滤高频泛化实体）
+        if self._role_table and cfg.role_bridge_weight > 0:
+            entities = getattr(self._role_table, '_entities', {})
+            if entities:
+                role_bridge = 0
+                entity_pairs_seen = set()
+
+                # 构建 phrase_only 的球体索引（完整 AH 对）
+                if cfg.role_bridge_phrase_only:
+                    phrase_spheres: Dict[str, List[str]] = {}
+                    for eid, ent in entities.items():
+                        as_phrase = list(getattr(ent, 'as_phrase', []) or [])
+                        if as_phrase:
+                            phrase_spheres[eid] = as_phrase
+                else:
+                    phrase_spheres = self._entity_to_spheres
+
+                for eid, ent in entities.items():
+                    co = getattr(ent, 'co_occurrences', {}) or {}
+                    if not co:
+                        continue
+                    spheres_e = phrase_spheres.get(eid, [])
+                    n_e = len(spheres_e)
+                    # 过滤：太少（不在球体）或太多（高频泛化实体）
+                    if n_e < 1 or n_e > cfg.role_bridge_max_entity_spread:
+                        continue
+
+                    # 取最强共现，但只取 >= min_cooccur 的
+                    strong_co = [
+                        (oeid, cnt) for oeid, cnt in co.items()
+                        if cnt >= cfg.role_bridge_min_cooccur
+                    ]
+                    strong_co.sort(key=lambda x: -x[1])
+
+                    for other_eid, co_count in strong_co[:5]:
+                        if other_eid <= eid:
+                            continue
+                        epair = (eid, other_eid)
+                        if epair in entity_pairs_seen:
+                            continue
+                        entity_pairs_seen.add(epair)
+
+                        spheres_other = phrase_spheres.get(other_eid, [])
+                        n_other = len(spheres_other)
+                        if n_other < 1 or n_other > cfg.role_bridge_max_entity_spread:
+                            continue
+
+                        # 桥接：A 含 entity1，B 含 entity2
+                        sphere_pairs_seen = set()
+                        for sid_a in spheres_e:
+                            for sid_b in spheres_other:
+                                if sid_a >= sid_b:
+                                    continue
+                                spair = (sid_a, sid_b)
+                                if spair in sphere_pairs_seen:
+                                    continue
+                                sphere_pairs_seen.add(spair)
+
+                                # 权重：共现越强 → 连接越强，但以 role_bridge_weight 为上限
+                                # co_count >= role_bridge_min_cooccur，所以起始比例 >= min/3
+                                ratio = min(1.0, co_count / max(cfg.role_bridge_min_cooccur * 2, 1))
+                                weight = cfg.role_bridge_weight * ratio
+                                weight = max(cfg.min_weight, weight)
+                                self._add_connection(sid_a, sid_b, weight)
+                                role_bridge += 1
+
+                if role_bridge:
+                    logger.info(f"  Role bridge: {role_bridge} edges")
+                    total_connections += role_bridge
 
         # 轴突连接（因果链检测）
         axon_total = self.detect_axon_batch(sphere_ids=sphere_ids)

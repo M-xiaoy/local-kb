@@ -50,10 +50,13 @@ from retrieval.activation import ActivationPropagator
 from retrieval.session_manager import SessionManager
 from retrieval.cluster_engine import ClusterEngine
 from retrieval.tools.navigate import navigate_sphere
+from api.rebuild import rebuild_spaces
 from retrieval.tools.explore import explore_cluster
 from retrieval.tools.trace import trace_conversation
 from retrieval.tools.bridge import find_bridge
 from pipeline.generator import AnswerGenerator, get_generator
+from core.kb import KnowledgeBase
+from core.repo.adapter import AdapterRepository
 
 logger = logging.getLogger(__name__)
 
@@ -717,6 +720,7 @@ def _error_response(request_id: str, error_type: str, message: str, detail: str 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
+
     """重写 HTTPException 响应为统一格式"""
     req_id = _make_request_id()
     logger.warning(
@@ -741,6 +745,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+
     """参数校验失败 → 指出哪个字段不对"""
     req_id = _make_request_id()
     errors = exc.errors()
@@ -765,6 +770,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+
     """兜底：捕获一切未处理的异常
 
     返回完整错误信息 + 把 traceback 写进日志。
@@ -844,19 +850,26 @@ class AppState:
             self.calibrator.attach(self.sphere_store, self.faiss_store._vectors)
 
     def ensure_role_table(self):
-        """按需加载角色共现表"""
+        """按需加载角色共现表（失败时降级为跳过）"""
         if self.role_table.entity_count == 0:
-            self.role_table.load()
+            try:
+                self.role_table.load()
+            except Exception as e:
+                logger.warning(f"Role table load failed: {e} — hierarchy will use entity edges only if available")
+                return
             if self.role_table.entity_count == 0 and self.sphere_store.count > 0:
                 # 首次构建
-                self.role_table.build_for_spheres(
-                    self.sphere_store.get_active()
-                )
-                self.role_table.save()
-                logger.info(
-                    f"Built role table from {self.sphere_store.count} spheres: "
-                    f"{self.role_table.entity_count} entities"
-                )
+                try:
+                    self.role_table.build_for_spheres(
+                        self.sphere_store.get_active()
+                    )
+                    self.role_table.save()
+                    logger.info(
+                        f"Built role table from {self.sphere_store.count} spheres: "
+                        f"{self.role_table.entity_count} entities"
+                    )
+                except Exception as e:
+                    logger.warning(f"Role table build failed: {e}")
 
     def _get_vector_cache(self, sphere_id: str):
         """向量缓存查询（给 hierarchy grower 用）"""
@@ -865,9 +878,14 @@ class AppState:
             return self.faiss_store._vectors[fid]
         return None
 
-    def build_hierarchy(self):
-        """全量构建层级：grow → embed → FAISS add → save"""
-        stats = self.hierarchy.grow()
+    def build_hierarchy(self, incremental: bool = False):
+        """构建层级：grow → embed → FAISS add → save
+
+        Args:
+            incremental: True=增量（保留旧层级，只处理新球体）
+                         False=全量重建
+        """
+        stats = self.hierarchy.grow(incremental=incremental)
 
         if stats.get("level1", 0) > 0:
             # 计算概念向量并写入 FAISS
@@ -904,6 +922,7 @@ class AppState:
 
 
 state = AppState()
+kb: KnowledgeBase | None = None
 
 
 # ──────────────────────────────────────────────
@@ -939,6 +958,14 @@ class UploadResponse(BaseModel):
     file_type: str
     chunks: int
     new_spheres: int
+    timing_ms: dict
+
+
+class BatchUploadResponse(BaseModel):
+    files: int
+    total_chunks: int
+    new_spheres: int
+    file_results: list[dict]
     timing_ms: dict
 
 
@@ -979,6 +1006,7 @@ class StatusResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+
     """启动时从持久化加载已有状态"""
     try:
         # WAL 恢复：处理未完成的写入
@@ -1121,19 +1149,50 @@ async def startup():
         # WAL 清理：删除 7 天前的已完成/已回滚条目
         state.wal.clean_old_entries(max_age_hours=24 * 7)
 
-        # ── 构建层级（社区检测→等级划分） ──
+        # ── 构建层级（v2 增量） ──
+        # 只加载保存的邻接图，不做全量重建（避免 O(N²) OOM）
         if sphere_count >= 5:
             try:
                 state.ensure_role_table()
-                stats = state.build_hierarchy()
-                logger.info(f"Hierarchy built on startup: {stats}")
+                from pipeline.hierarchy import load_adjacency
+                saved_adj, _, _ = load_adjacency()
+                if saved_adj and len(saved_adj) > 100:
+                    logger.info(
+                        f"Hierarchy adjacency loaded ({len(saved_adj)} nodes), "
+                        f"running incremental build"
+                    )
+                    stats = state.build_hierarchy(incremental=True)
+                    logger.info(f"Hierarchy incremental build: {stats}")
+                else:
+                    logger.info(
+                        "No saved hierarchy or graph too small, "
+                        "skipping startup rebuild"
+                    )
             except Exception as e:
-                logger.warning(f"Hierarchy build on startup failed: {e}")
+                logger.warning(f"Hierarchy build on startup failed (non-critical): {e}")
 
         if faiss_count > 0 and sphere_count > 0:
             logger.info("Knowledge base loaded successfully")
         else:
             logger.info("Empty knowledge base — ready for uploads")
+
+        # ── KnowledgeBase 核心层初始化（Phase 4） ──
+        global kb
+        kb = KnowledgeBase(
+            repo=AdapterRepository(
+                state.sphere_store, state.faiss_store, state.registry
+            ),
+            retriever=state.retriever,
+            sessions=state.sessions,
+            generator=state.generator,
+            rewriter=state.rewriter,
+            field_detector=state.field_detector,
+            cluster_engine=state.cluster_engine,
+        )
+        logger.info(
+            f"KnowledgeBase initialized: {kb.sphere_count} spheres, "
+            f"subsystems={{retriever,sessions,generator,rewriter,field_detector}}"
+        )
     except Exception as e:
         logger.warning(f"Startup load failed (first run?): {e}")
 
@@ -1144,6 +1203,7 @@ async def startup():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
+
     """前端首页"""
     return HTMLResponse(content=HTML_PAGE)
 
@@ -1154,19 +1214,22 @@ async def index():
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
+
     """知识库状态概览"""
-    active = state.sphere_store.count
-    total = state.sphere_store.total_count
-    fields = state.field_detector.fields
-    field_counts = {f: state.field_detector._field_counts.get(f, 0) for f in fields}
+    stats = kb.get_stats() if kb else {}
+    fields = kb.field_detector.fields if kb and kb.field_detector else []
+    field_counts = {
+        f: kb.field_detector._field_counts.get(f, 0)
+        for f in fields
+    } if kb and kb.field_detector else {}
     try:
         hierarchy = state.hierarchy.stats() if hasattr(state, 'hierarchy') else {}
     except (AttributeError, Exception):
         hierarchy = {}
     return StatusResponse(
-        total_spheres=total,
-        active_spheres=active,
-        faiss_vectors=state.faiss_store.count,
+        total_spheres=stats.get("total_spheres", 0),
+        active_spheres=stats.get("active_spheres", 0),
+        faiss_vectors=kb.repo.count() if kb else 0,
         fields=fields,
         field_counts=field_counts,
         hierarchy=hierarchy,
@@ -1188,280 +1251,139 @@ async def upload_file(
     Args:
         file: PDF/DOCX/MD/TXT 文件
         source_type: 场域标签（如"技术笔记"、"小说创作"）
-        auto_rebuild: 是否在入库后保存全部状态
+        auto_rebuild: 是否在入库后重建索引
+    """
+    from api.upload import handle_upload_file
+    result = await handle_upload_file(state, file, source_type, auto_rebuild, kb=kb)
+    return UploadResponse(
+        file=result["file"],
+        file_type=result["file_type"],
+        chunks=result["chunks"],
+        new_spheres=result["new_spheres"],
+        timing_ms={k: round(v * 1000, 1) for k, v in result["timings"].items()},
+    )
+# 端点：批量上传
+# ──────────────────────────────────────────────
+
+@app.post("/upload/batch", response_model=BatchUploadResponse)
+async def upload_batch(
+
+    files: list[UploadFile] = File(...),
+    auto_rebuild: bool = Form(True),
+    max_workers: int = Form(4),
+):
+    logger.debug('[TRACE]')
+    """批量上传多个文件，embedding 和后处理池化
+
+    Args:
+        files: 多个 PDF/DOCX/MD/TXT 文件
+        auto_rebuild: 是否在所有文件入库后执行一次重建
+        max_workers: 关键词提取并行数（默认 4，实际场景：CPU 6-8 核设 4-6，4 核以下设 2）
     """
     timings = {}
     t0 = time.time()
 
-    # 1. 保存上传文件
-    file_path = state.uploads_dir / file.filename
-    content = await file.read()
-    file_path.write_bytes(content)
-    timings["save"] = time.time() - t0
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
 
-    # 2. 解析
-    t1 = time.time()
-    try:
-        result: ParseResult = parse_file(str(file_path))
-    except UnsupportedFileError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Parse failed: {e}")
-    timings["parse"] = time.time() - t1
-
-    # 2.5 文档级关键术语抽取（在切片之前，保证覆盖面）
-    t_doc = time.time()
+    # ── 1. 并行解析 + 关键词提取 ────────────
+    parse_ts = time.time()
     from pipeline.attr_head_extractor import AttrHeadExtractor
-    _doc_terms = AttrHeadExtractor().extract(result.text)
-    # 去重，取完整短语作为文档级术语
-    doc_term_texts = list(dict.fromkeys(
-        p.full_phrase for p in _doc_terms if p.has_attributive
-    ))
-    # 如果没有 AH 短语，fallback 到文档开头的前 3 个句子
-    if not doc_term_texts:
-        sentences = [s.strip() for s in result.text[:500].split("。") if len(s.strip()) > 5]
-        doc_term_texts = sentences[:3]
-    timings["doc_terms"] = time.time() - t_doc
-    logger.info(f"  doc_terms: {len(doc_term_texts)} terms extracted")
+    _extractor = AttrHeadExtractor()
+    sem = asyncio.Semaphore(max_workers)
 
-    # 3. 切片
-    t2 = time.time()
-    if result.file_type == "md":
-        raw_chunks = chunk_markdown(result.text)
-    else:
-        raw_chunks = chunk_text(result.text, source_type=source_type)
-    chunks = [c for c in raw_chunks if c.strip()]
-    timings["chunk"] = time.time() - t2
+    async def _parse_one(file: UploadFile) -> tuple:
+        """解析单个文件，返回 (text, source_type, doc_terms, filename)"""
+        async with sem:
+            if not file.filename:
+                return None
+            fname = file.filename
+            file_path = state.uploads_dir / fname
+            content = await file.read()
+            file_path.write_bytes(content)
 
-    if not chunks:
-        raise HTTPException(status_code=422, detail="No text chunks extracted from file")
-
-    # ── 3.5 预过滤：只嵌入真正的新切片 ──────────
-    t_pre = time.time()
-    chunk_sphere_ids = [make_sphere_id(c, file.filename) for c in chunks]
-
-    # 拆分为新/旧两组
-    # new_mask[i]=True  → 需要嵌入
-    # reused_vectors    → 已缓存的向量，按原序收集
-    reused_vectors: dict = {}  # chunk_index → vector
-    new_mask = []
-    faiss_cache_hot = state.faiss_store.is_built
-
-    for i, sid in enumerate(chunk_sphere_ids):
-        existing = state.sphere_store.get(sid)
-        if existing and existing.active and faiss_cache_hot:
-            fid = state.registry.faiss_id(sid)
-            if fid is not None and fid in state.faiss_store._vectors:
-                reused_vectors[i] = state.faiss_store._vectors[fid]
-                new_mask.append(False)
-                continue
-        new_mask.append(True)
-
-    new_sphere_ids = [chunk_sphere_ids[i] for i, m in enumerate(new_mask) if m]
-    new_chunks = [chunks[i] for i, m in enumerate(new_mask) if m]
-    timings["prefilter"] = time.time() - t_pre
-    logger.info(
-        f"  prefilter: {len(new_chunks)} new / {len(chunks) - len(new_chunks)} cached "
-        f"(faiss_cache={'hot' if faiss_cache_hot else 'cold'})"
-    )
-
-    # ── 4. 只嵌入新切片 ────────────────────────
-    t3 = time.time()
-    if new_chunks:
-        new_vectors = state.embedder.embed_documents(new_chunks)
-    else:
-        embed_dim = state.embedder.embed_dim
-        new_vectors = np.zeros((0, embed_dim), dtype=np.float32)
-    timings["embed"] = time.time() - t3
-
-    # ── 4.5 按原始顺序重建完整向量列表 ──────────
-    chunk_vectors = np.zeros(
-        (len(chunks), state.embedder.embed_dim), dtype=np.float32
-    )
-    new_idx = 0
-    for i in range(len(chunks)):
-        if i in reused_vectors:
-            chunk_vectors[i] = reused_vectors[i]
-        else:
-            chunk_vectors[i] = new_vectors[new_idx]
-            new_idx += 1
-
-    # ── 5. 创建新球体（含 gravity_field 预计算）──
-    t4 = time.time()
-    new_spheres = 0
-    added_vectors: list = []
-    added_ids: list = []
-    added_sphere_ids: list = []
-    new_gravity_fields: list = []  # 收集新球体的 gravity_field，给后续步骤用
-
-    for i, (sphere_id, chunk_txt, vec) in enumerate(zip(chunk_sphere_ids, chunks, chunk_vectors)):
-        if not new_mask[i]:
-            # 旧球体：检查 gravity_field 是否需要补算
-            existing = state.sphere_store.get(sphere_id)
-            if existing and not existing.gravity_field:
-                existing.gravity_field = state.field_detector.compute_gravity_field(vec)
-            continue
-
-        # 新球体：预计算 gravity_field（到各场域质心的引力值）
-        gravity_field = state.field_detector.compute_gravity_field(vec)
-
-        # 提取关键词权重（用于术语引力混合检索）
-        term_weights = extract_keywords(chunk_txt)
-
-        sphere = Sphere(
-            id=sphere_id,
-            text=chunk_txt,
-            source_file=file.filename,
-            source_type=source_type or (
-                "技术笔记" if result.metadata.get("headings") else "其他"
-            ),
-            mass=1.0,
-            gravity_field=gravity_field,
-            term_weights=term_weights,
-            doc_terms=doc_term_texts,
-            created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        )
-        if state.sphere_store.add(sphere):
-            new_spheres += 1
-        faiss_id = state.registry.register(sphere_id)
-        added_vectors.append(vec)
-        added_ids.append(faiss_id)
-        added_sphere_ids.append(sphere_id)
-        new_gravity_fields.append(gravity_field)
-    timings["create_spheres"] = time.time() - t4
-
-    # ── 5.5 WAL：记录本次操作 ─────────────────
-    wal_entry = None
-    if new_spheres > 0 and auto_rebuild:
-        wal_entry = state.wal.create(
-            file_name=file.filename,
-            source_type=source_type or (
-                "技术笔记" if result.metadata.get("headings") else "其他"
-            ),
-            sphere_ids=added_sphere_ids,
-            faiss_ids=added_ids,
-            chunks_total=len(new_chunks),
-        )
-
-    # ── 6. 新向量 → FAISS ─────────────────────
-    t5 = time.time()
-    if added_vectors:
-        vectors_array = np.stack(added_vectors, axis=0)
-        ids_array = np.array(added_ids, dtype=np.int64)
-        state.faiss_store.add(vectors_array, ids_array)
-    timings["faiss_add"] = time.time() - t5
-
-    # ── 7. 新向量 → 场域质心 ───────────────────
-    t6 = time.time()
-    if source_type and added_vectors:
-        for vec in added_vectors:
-            state.field_detector.update_centroid(source_type, vec)
-    timings["field_update"] = time.time() - t6
-
-    # ── 8. 持久化（原子写入）───────────────────
-    t7 = time.time()
-    if new_spheres > 0 and auto_rebuild:
-        # 标记 WAL 为 committing（正在写盘）
-        if wal_entry:
-            state.wal.mark_committing(wal_entry)
-
-        try:
-            _atomic_save_all()
-        except Exception as e:
-            logger.error(f"Atomic save failed: {e}")
-            if wal_entry:
-                state.wal._rollback(
-                    wal_entry, state.sphere_store,
-                    state.registry, state.faiss_store
-                )
-                state.wal.mark_rolled_back(wal_entry)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Persist failed, changes rolled back: {e}"
-            )
-
-        # 标记 WAL 为 done（安全完成）
-        if wal_entry:
-            state.wal.mark_done(wal_entry)
-    timings["persist"] = time.time() - t7
-
-    # ── 9. 上传后聚类 ────────────────────────
-    t8 = time.time()
-    if new_spheres > 0 and auto_rebuild:
-        active_spheres = state.sphere_store.get_active()
-        if len(active_spheres) >= 2:  # 至少 2 个才能聚类
             try:
-                vectors = []
-                for s in active_spheres:
-                    fid = state.registry.faiss_id(s.id)
-                    if fid is not None and fid in state.faiss_store._vectors:
-                        vectors.append(state.faiss_store._vectors[fid])
-
-                if len(vectors) >= 2:
-                    vectors_arr = np.stack(vectors, axis=0)
-                    # run_in_executor 避免阻塞事件循环（sklearn KMeans 是同步的）
-                    loop = asyncio.get_event_loop()
-                    centroids, labels, scores = await loop.run_in_executor(
-                        None, state.cluster_engine.fit_predict, vectors_arr
-                    )
-
-                    # 更新每个球体的 cluster_id + gravity_field
-                    k = centroids.shape[0]
-                    label_map = {i: f"簇{i}" for i in range(k)}
-
-                    for sphere, label, score in zip(active_spheres, labels, scores):
-                        sphere.cluster_id = int(label)
-
-                    # 批量重算 gravity_field
-                    # 统计每个簇的球体数
-                    cluster_counts = {}
-                    for s in active_spheres:
-                        if s.cluster_id >= 0:
-                            cluster_counts[s.cluster_id] = cluster_counts.get(s.cluster_id, 0) + 1
-
-                    state.field_detector.sync_from_clusters(
-                        centroids, label_map, cluster_counts
-                    )
-                    state.field_detector.rebuild_all_gravity_fields(
-                        state.sphere_store,
-                        {s.id: state.faiss_store._vectors.get(
-                            state.registry.faiss_id(s.id)
-                        ) for s in active_spheres if state.registry.faiss_id(s.id) is not None}
-                    )
-
-                    # 持久化聚类状态
-                    state.cluster_engine.save()
-                    logger.info(f"Post-upload clustering: {len(active_spheres)} spheres → {k} clusters")
+                result = await asyncio.to_thread(parse_file, str(file_path))
             except Exception as e:
-                logger.warning(f"Post-upload clustering failed (non-critical): {e}")
-    timings["clustering"] = time.time() - t8
+                try: file_path.unlink()
+                except: pass
+                return {"file": fname, "error": str(e)}
 
-    # ── 10. 角色共现表增量更新 ───────────────
-    t9 = time.time()
-    if new_spheres > 0 and auto_rebuild:
-        for sphere_id in added_sphere_ids:
-            sphere = state.sphere_store.get(sphere_id)
-            if sphere and sphere.text:
-                state.role_table.register_text(sphere.id, sphere.text)
-        state.role_table.save()
-        logger.debug(f"Role table: +{new_spheres} spheres, "
-                     f"{state.role_table.entity_count} total entities")
-    timings["role_table"] = time.time() - t9
+            # 文档级关键术语提取
+            try:
+                _doc_terms = await asyncio.to_thread(_extractor.extract, result.text)
+                doc_term_texts = list(dict.fromkeys(
+                    p.full_phrase for p in _doc_terms if p.has_attributive
+                ))
+                if not doc_term_texts:
+                    doc_term_texts = [s.strip() for s in result.text[:500].split("。") if len(s.strip()) > 5][:3]
+            except Exception:
+                doc_term_texts = []
+
+            source_type = "技术笔记" if result.metadata.get("headings") else "其他"
+
+            try: file_path.unlink()
+            except: pass
+
+            return {
+                "file": fname,
+                "text": result.text,
+                "source_type": source_type,
+                "doc_terms": doc_term_texts,
+                "result": result,
+            }
+
+    parse_results = await asyncio.gather(*[_parse_one(f) for f in files])
+    parse_results = [r for r in parse_results if r and r.get("text")]
+    file_results = [{"file": r["file"], "status": "ok", "chunks": 0} for r in parse_results]
+    timings["parse_all"] = time.time() - parse_ts
+
+    if not parse_results:
+        raise HTTPException(status_code=422, detail="No parsable files")
+
+    # ── 2. 通过 kb.add_document 统一入库 ─────
+    ingest_ts = time.time()
+    total_new = 0
+    for pr in parse_results:
+        added = kb.add_document(
+            text=pr["text"],
+            source_file=pr["file"],
+            source_type=pr["source_type"],
+            chunk=True,
+            doc_terms=pr["doc_terms"],
+        )
+        total_new += added
+        # 更新 file_results 的 chunks 数
+        for fr in file_results:
+            if fr["file"] == pr["file"]:
+                # 估算 chunks 数：
+                fr["chunks"] = added if added > 0 else len(pr["text"].split("\n"))
+                break
+
+    timings["kb_ingest"] = time.time() - ingest_ts
+
+    # ── 3. 持久化 + 重建 ────────────────────
+    if total_new > 0:
+        persist_ts = time.time()
+        _atomic_save_all()
+        timings["persist"] = time.time() - persist_ts
+
+        if auto_rebuild:
+            cluster_ts = time.time()
+            try:
+                result = await rebuild_spaces(state, mode="cluster")
+                timings["rebuild"] = result.get("timings", {})
+            except Exception as e:
+                logger.warning(f"Batch rebuild failed (non-critical): {e}")
+            timings["rebuild_total"] = time.time() - cluster_ts
 
     timings["total"] = time.time() - t0
 
-    # 清理：上传成功后删除原始文件
-    try:
-        if file_path.exists():
-            file_path.unlink()
-    except Exception as e:
-        logger.warning(f"Failed to delete uploaded file {file.filename}: {e}")
-
-    return UploadResponse(
-        file=file.filename,
-        file_type=result.file_type,
-        chunks=len(chunks),
-        new_spheres=new_spheres,
+    return BatchUploadResponse(
+        files=len(files),
+        total_chunks=total_new,
+        new_spheres=total_new,
+        file_results=file_results,
         timing_ms={k: round(v * 1000, 1) for k, v in timings.items()},
     )
 
@@ -1472,21 +1394,13 @@ async def upload_file(
 
 @app.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest):
-    """检索问题
-
-    Args:
-        query: 用户问题
-        top_k: 返回结果数量
-        fetch_k: FAISS 粗搜候选池大小
-
-    Returns:
-        排序后的切片 + 场域亲和度 + 耗时
-    """
-    if not state.is_loaded():
+    logger.debug('[TRACE]')
+    """检索问题"""
+    if kb is None or kb.repo.count() == 0:
         raise HTTPException(status_code=400, detail="Knowledge base is empty. Upload files first.")
 
-    # 会话管理：自动创建（客户端不传时也生成 session_id）
-    session = state.sessions.get_or_create(request.session_id)
+    # 会话管理：通过 kb 访问
+    session = kb.sessions.get_or_create(request.session_id)
 
     # 处理聚焦状态
     if request.reset_focus:
@@ -1494,12 +1408,10 @@ async def query(request: QueryRequest):
             session.reset_focus()
         effective_focus = None
     elif request.field_focus is not None:
-        # 用户明确指定聚焦
         if session:
             session.set_focus(request.field_focus)
         effective_focus = request.field_focus
     elif session and session.field_focus:
-        # 沿用会话中的聚焦状态
         effective_focus = session.field_focus
     else:
         effective_focus = None
@@ -1509,44 +1421,50 @@ async def query(request: QueryRequest):
     if session:
         exclude |= session.exclude_ids
 
-    # 确保连接层已初始化（如果是 gravity/deep/poincare 模式）
+    # 确保连接层已初始化
     if request.mode in ("gravity", "deep", "poincare"):
         state.ensure_connections()
 
-    result: RetrievalResult = state.retriever.retrieve(
-        query=request.query,
+    # 通过 kb.query() 统一查询入口
+    q_mode = request.mode if request.mode != "deep" else "poincare"
+    result = kb.query(
+        query_text=request.query,
         top_k=request.top_k,
+        mode=q_mode,
         fetch_k=request.fetch_k,
         field_focus=effective_focus,
         exclude_ids=list(exclude),
-        mode=request.mode,
         use_activation=request.use_activation,
         use_reranker=request.use_reranker,
         max_hops=request.max_hops,
     )
 
     # 记录返回的球体 ID 到会话
-    returned_ids = [s.id for s in result.spheres]
+    returned_ids = result.sphere_ids
     if session:
         session.add_excluded(returned_ids)
 
+    # 获取球体元数据（从 repo 和 SphereData 接口）
+    result_spheres = []
+    for idx, sid in enumerate(result.sphere_ids):
+        sp = kb.repo.get(sid)
+        score_val = result.scores[idx] if idx < len(result.scores) else 0.0
+        result_spheres.append({
+            "text": sp.text if sp else "",
+            "source_file": sp.source_file if sp else "",
+            "source_type": sp.source_type if sp else "",
+            "sphere_id": sid,
+            "score": float(round(score_val, 4)),
+            "cluster_id": sp.cluster_id if sp else -1,
+            "poincare_norm": sp.poincare_norm if sp else None,
+        })
+
     return QueryResponse(
-        query=result.query,
-        results=[
-            {
-                "text": s.text,
-                "source_file": s.source_file,
-                "source_type": s.source_type,
-                "score": float(round(result.scores[i], 4)),
-                "sphere_id": s.id,
-                "gravity_field": s.gravity_field if s.gravity_field else None,
-                "cluster_id": s.cluster_id,
-            }
-            for i, s in enumerate(result.spheres)
-        ],
-        field_affinities={k: float(v) for k, v in result.field_affinities.items()},
-        total_spheres=result.total_count,
-        timing_ms={k: float(round(v * 1000, 1)) for k, v in result.timing.items()},
+        query=request.query,
+        results=result_spheres,
+        field_affinities={},
+        total_spheres=kb.repo.count(),
+        timing_ms={"total": 0},
         session_id=session.session_id if session else None,
         focus_field=effective_focus if effective_focus else None,
     )
@@ -1558,45 +1476,58 @@ async def query(request: QueryRequest):
 
 @app.post("/ask")
 async def ask(request: AskRequest):
+
     """检索上下文并生成回答
 
     先走完整检索流程，再根据选择的模型生成回答。
     支持 model=ollama|deepseek|agent（空=配置默认）。
     """
-    if not state.is_loaded():
+    if kb is None or kb.repo.count() == 0:
         raise HTTPException(status_code=400, detail="Knowledge base is empty. Upload files first.")
 
     # 0. 会话管理 + 对话历史
-    session = state.sessions.get_or_create(request.session_id)
+    session = kb.sessions.get_or_create(request.session_id)
     history_text = session.history_text
 
-    # 1. 检索上下文（纯 FAISS 相似度）
-    # 使用 gravity 模式获取更丰富的上下文
+    # 1. 检索上下文（通过 kb.query 统一入口）
     state.ensure_connections()
-    retrieval_result: RetrievalResult = state.retriever.retrieve(
-        query=request.query,
+    search_result = kb.query(
+        query_text=request.query,
         top_k=request.top_k,
-        field_focus=request.field_focus,
         mode="poincare",
+        field_focus=request.field_focus,
         use_reranker=False,
     )
 
-    # 2. 提取上下文文本
-    context_texts = [s.text for s in retrieval_result.spheres]
+    # 获取球体对象（kb.query 返回 SearchResult，需要从 repo 补充元数据）
+    from storage.sphere_store import Sphere
+    spheres = []
+    scores_list = []
+    for i, sid in enumerate(search_result.sphere_ids):
+        sp = kb.repo.get(sid)
+        if sp:
+            spheres.append(sp)
+            scores_list.append(search_result.scores[i] if i < len(search_result.scores) else 0.0)
+
+    # 2. 提取上下文文本（结构化格式）
+    from pipeline.result_formatter import format_context_block, format_sphere
+    role_table = getattr(state, 'role_table', None)
+    context_texts = [
+        format_context_block(s, role_table, index=i)
+        for i, s in enumerate(spheres)
+    ]
     context_spheres = [
         {
-            "text": s.text[:200] + "..." if len(s.text) > 200 else s.text,
-            "source_file": s.source_file,
-            "source_type": s.source_type,
-            "score": round(retrieval_result.scores[i], 4) if i < len(retrieval_result.scores) else 0.0,
+            **format_sphere(s, role_table),
+            "score": round(scores_list[i], 4) if i < len(scores_list) else 0.0,
             "cluster_id": s.cluster_id,
         }
-        for i, s in enumerate(retrieval_result.spheres)
+        for i, s in enumerate(spheres)
     ]
 
     # 3. 生成回答（带上对话历史）
     model_name = request.model or None  # None = config default
-    answer_result = state.generator.generate(
+    answer_result = kb.generator.generate(
         query=request.query,
         context_texts=context_texts,
         model=model_name,
@@ -1608,7 +1539,7 @@ async def ask(request: AskRequest):
     if answer_result.text and not answer_result.error:
         session.add_history(request.query, answer_result.text)
 
-    # 构造响应（手动转换所有值为 Python 原生类型，避免 numpy 序列化问题）
+    # 构造响应
     response_data = {
         "query": str(request.query),
         "answer": str(answer_result.text) if answer_result.text else "",
@@ -1617,9 +1548,13 @@ async def ask(request: AskRequest):
         "generation_ms": float(round(answer_result.timing_ms, 1)) if answer_result.timing_ms else 0.0,
         "results": [
             {
+                "id": str(r.get("id", "")),
                 "text": str(r.get("text", "")),
                 "source_file": str(r.get("source_file", "")),
                 "source_type": str(r.get("source_type", "")),
+                "time": str(r.get("time", "")),
+                "summary": str(r.get("summary", "")),
+                "key_entities": [str(e) for e in r.get("key_entities", [])],
                 "score": float(r.get("score", 0.0)),
                 "cluster_id": int(r.get("cluster_id", -1)),
             }
@@ -1639,8 +1574,9 @@ async def ask(request: AskRequest):
 
 @app.get("/backends")
 async def list_backends():
+
     """列出可用的生成后端"""
-    gen = get_generator()
+    gen = kb.generator if kb else get_generator()
     backends = gen.list_backends()
     available = {k: gen.is_available(k) for k in backends}
     return {"backends": backends, "available": available, "default": "ollama"}
@@ -1652,65 +1588,10 @@ async def list_backends():
 
 @app.post("/rebuild")
 async def rebuild():
-    """从持久化数据重建全部状态
-
-    适用场景：手动修改了 spheres.json 或 registry.json 后重新索引
-    """
+    """从持久化数据重建全部状态"""
     try:
-        # 清空当前状态
-        state.registry.clear()
-        state.faiss_store = FaissStore()
-        state.field_detector = FieldDetector()
-
-        # 重新加载
-        state.registry.load()
-        state.sphere_store.load()
-
-        # 从 sphere_store 重新构建 FAISS 索引和场域
-        active_spheres = state.sphere_store.get_active()
-        if not active_spheres:
-            return {"status": "ok", "rebuilt": 0, "message": "No active spheres to rebuild"}
-
-        # 按批次嵌入 + 添加
-        all_vectors = []
-        all_ids = []
-        field_vectors: dict = {}
-
-        for sphere in active_spheres:
-            vec = state.embedder.embed_documents([sphere.text])[0]
-            faiss_id = state.registry.register(sphere.id)
-            all_vectors.append(vec)
-            all_ids.append(faiss_id)
-
-            # 收集场域向量
-            if sphere.source_type:
-                field_vectors.setdefault(sphere.source_type, []).append(vec)
-
-        # 构建 FAISS 索引
-        vectors_array = np.stack(all_vectors, axis=0)
-        ids_array = np.array(all_ids, dtype=np.int64)
-        state.faiss_store.build(vectors_array, ids_array)
-
-        # 重建场域质心
-        state.field_detector.rebuild_centroids(field_vectors)
-
-        # 持久化
-        state.registry.save()
-        state.faiss_store.save()
-
-        # 重建层级
-        try:
-            state.ensure_role_table()
-            stats = state.build_hierarchy()
-            logger.info(f"Hierarchy rebuilt: {stats}")
-        except Exception as e:
-            logger.warning(f"Hierarchy rebuild failed: {e}")
-
-        return {
-            "status": "ok",
-            "rebuilt": len(active_spheres),
-            "fields": state.field_detector.fields,
-        }
+        result = await rebuild_spaces(state, mode="full")
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Rebuild failed: {e}")
 
@@ -1721,10 +1602,12 @@ async def rebuild():
 
 @app.post("/rewrite")
 async def api_rewrite(text: str = Form(...), source_type: str = Form(""),
+
                       source_file: str = Form("")):
     """手动重写一段文本（入库前清洁）"""
     try:
-        clean = state.rewriter.rewrite(text, source_type, source_file)
+        rewriter = kb.rewriter if kb else state.rewriter
+        clean = rewriter.rewrite(text, source_type, source_file)
         return {
             "status": "ok",
             "cleaned_text": clean.cleaned_text,
@@ -1744,6 +1627,7 @@ async def api_rewrite(text: str = Form(...), source_type: str = Form(""),
 
 @app.post("/rebuild-connections")
 async def api_rebuild_connections():
+
     """全量重建球体连接网络"""
     state.ensure_connections()
     try:
@@ -1762,6 +1646,7 @@ async def api_rebuild_connections():
 
 @app.post("/rebuild-axon")
 async def api_rebuild_axon():
+
     """仅重建轴突（因果链）连接，不重建树突"""
     state.ensure_connections()
     try:
@@ -1782,11 +1667,22 @@ async def api_rebuild_axon():
 # ──────────────────────────────────────────────
 
 @app.post("/rebuild-hierarchy")
-async def api_rebuild_hierarchy():
-    """重建层级结构（社区检测→等级划分）"""
+async def api_rebuild_hierarchy(request: Request):
+
+    """重建层级结构（社区检测→等级划分）
+
+    默认增量重建。全量重建调用 POST /rebuild-hierarchy 传 {"force": true}
+    """
     try:
-        state.ensure_role_table()
-        stats = state.build_hierarchy()
+        body = await request.json()
+        force = body.get("force", False)
+    except Exception:
+        force = False
+
+    # ensure_role_table 失败不阻塞后续重建（降级为无实体边）
+    state.ensure_role_table()
+    try:
+        stats = state.build_hierarchy(incremental=not force)
         return {"status": "ok", "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Hierarchy rebuild failed: {e}")
@@ -1794,6 +1690,7 @@ async def api_rebuild_hierarchy():
 
 @app.post("/calibrate")
 async def api_calibrate():
+
     """触发球体质量与多样性校准"""
     state.ensure_connections()
     try:
@@ -1816,11 +1713,12 @@ async def api_calibrate():
 
 @app.get("/navigate/{sphere_id}")
 async def api_navigate(sphere_id: str, hops: int = 2):
+
     """从指定球体出发导航连接图"""
     state.ensure_connections()
     result = navigate_sphere(
         sphere_id=sphere_id,
-        sphere_store=state.sphere_store,
+        sphere_store=kb.repo._sphere if kb else state.sphere_store,
         connections_provider=state.conn_detector.get_connections,
         hops=hops,
     )
@@ -1833,11 +1731,12 @@ async def api_navigate(sphere_id: str, hops: int = 2):
 
 @app.get("/explore/{cluster_id}")
 async def api_explore(cluster_id: int, sort_by: str = "mass", top_k: int = 30):
+
     """展开一个聚簇的全部内容"""
     result = explore_cluster(
         cluster_id=cluster_id,
-        sphere_store=state.sphere_store,
-        field_detector=state.field_detector,
+        sphere_store=kb.repo._sphere if kb else state.sphere_store,
+        field_detector=kb.field_detector if kb else state.field_detector,
         sort_by=sort_by,
         top_k=top_k,
     )
@@ -1850,11 +1749,12 @@ async def api_explore(cluster_id: int, sort_by: str = "mass", top_k: int = 30):
 
 @app.get("/trace")
 async def api_trace(source_file: str):
+
     """还原一个会话的时间线"""
     state.ensure_connections()
     result = trace_conversation(
         source_file=source_file,
-        sphere_store=state.sphere_store,
+        sphere_store=kb.repo._sphere if kb else state.sphere_store,
         connections_provider=state.conn_detector.get_connections if state.conn_detector else None,
     )
     return result
@@ -1866,12 +1766,13 @@ async def api_trace(source_file: str):
 
 @app.get("/bridge/{sphere_a}/{sphere_b}")
 async def api_bridge(sphere_a: str, sphere_b: str):
+
     """找两个球体之间的最短路径"""
     state.ensure_connections()
     result = find_bridge(
         sphere_a=sphere_a,
         sphere_b=sphere_b,
-        sphere_store=state.sphere_store,
+        sphere_store=kb.repo._sphere if kb else state.sphere_store,
         connections_provider=state.conn_detector.get_connections,
         max_hops=4,
     )
