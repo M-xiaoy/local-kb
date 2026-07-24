@@ -1,17 +1,17 @@
 """
-retriever.py — 重力知识库·检索编排器（v3 硬化版）
+retriever.py — 重力知识库·检索编排器（v4 双空间混合）
 =================================================
-2026-07-24 架构硬化决策：
+2026-07-24 第四空间诊断确认：
 
-  Embed (BGE-M3) → FAISS ANN (Top-50) → Poincaré Rerank (Top-10)
+  Embed (BGE-M3) → FAISS ANN (Top-50) → Dual-Space Rerank (Top-10)
 
-  FAISS 欧氏初召保证召回速度（~6ms），Poincaré 测地线距离重排
-  提升排序精度（+8pp recall@10 → 37.3%）。
-
-  旧有组件（DiversitySorter / FieldDetector / TractionReranker / etc.）
-  已物理移出检索链路，降级为 analysis/deprecated_pipeline/ 离线使用。
-
-  详见根目录 ARCHITECTURE_DECISION_LOG.md
+  距离公式：d = alpha1 * ball_distance + alpha2 * euclidean_distance
+  - 球面子空间（f[:256]）：聚类亲疏
+  - 欧氏子空间（f[256:]）：语义远近
+  
+  诊断实验确认球面分量能有效区分同簇和无关对，α1=2.0, α2=1.0 起步。
+  Poincaré 双曲分量因与欧氏高度相关（corr=0.87）暂不启用，
+  等待投影层解耦后恢复三空间混合。
 """
 
 import logging
@@ -25,7 +25,7 @@ from pipeline.embedder import Embedder
 from storage.faiss_store import FaissStore
 from storage.registry import Registry
 from storage.sphere_store import SphereStore, Sphere
-from retrieval.poincare_rerank import rerank as poincare_rerank
+from retrieval.dual_space_rerank import dual_space_rerank
 
 logger = logging.getLogger(__name__)
 
@@ -162,27 +162,27 @@ class Retriever:
         valid_vecs_arr = np.stack(valid_vectors, axis=0)
         timings["resolve"] = time.time() - t_resolve
 
-        # ── Step 4: 重排（Poincaré 测地线距离 or FAISS 余弦） ──
+        # ── Step 4: 重排（双空间混合距离 or FAISS 余弦） ──
         t_rerank = time.time()
 
         if use_hyperbolic:
-            word_count = len(query.strip().split())
-            query_norm = max(0.1, min(0.9, 0.9 - 0.05 * word_count))
-            sorted_ids, sorted_dists = poincare_rerank(
+            # 双空间混合重排：球面子空间（聚类）+ 欧氏子空间（语义）
+            reranked = dual_space_rerank(
                 query_vector=query_vector,
-                candidate_ids=valid_ids_arr,
                 candidate_vectors=valid_vecs_arr,
-                faiss_to_norm=self._faiss_to_norm,
-                query_norm=query_norm,
+                candidate_ids=valid_ids_arr.tolist(),
+                top_k=None,  # 全量重排，后续截断
             )
-            timings["poincare_rerank"] = time.time() - t_rerank
+            sorted_ids = np.array([sid for sid, _ in reranked], dtype=np.int64)
+            sorted_dists = np.array([d for _, d in reranked], dtype=np.float64)
+            timings["dual_space_rerank"] = time.time() - t_rerank
         else:
             # 纯 FAISS 余弦距离排序（对照组）
             sorted_dists = faiss_distances[:len(valid_ids_arr)]
             sorted_indices = np.argsort(-sorted_dists)  # 余弦距离越大越相关
             sorted_ids = valid_ids_arr[sorted_indices]
             sorted_dists = sorted_dists[sorted_indices]
-            timings["poincare_rerank"] = time.time() - t_rerank
+            timings["dual_space_rerank"] = time.time() - t_rerank
             timings["mode"] = "cosine"
 
         # ── Step 5: 查 Sphere 元数据 + 来源去重 ──

@@ -25,7 +25,7 @@ from core.repo.interfaces import (
     SearchResult,
     SphereData,
 )
-from pipeline.embedder import Embedder, poincare_project_query
+from pipeline.embedder import Embedder
 
 logger = logging.getLogger(__name__)
 
